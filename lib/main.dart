@@ -347,6 +347,14 @@ class _EcgHomePageState extends State<EcgHomePage> {
   // conversion (tweak this to calibrate -> mV)
   double adcToMv = 0.1; // initial guess: 1 count => 0.1 mV. Adjust as needed.
 
+  // add in state
+  bool measuring = false;
+  final List<double> collectedSamplesAll = []; // full recording (mV)
+  final int smoothingWindow = 3; // moving average window
+  final List<double> _baselineWindow = []; // for baseline removal
+  final int baselineWindowSize = 25; // adjust for baseline estimation
+  int _zeroFrameCount = 0;
+
   @override
   void initState() {
     super.initState();
@@ -447,6 +455,61 @@ class _EcgHomePageState extends State<EcgHomePage> {
         );
   }
 
+  void _onMeasurementComplete(Map<String, dynamic> result) {
+    if (!mounted) return;
+    measuring = false;
+    // unsubscribe so we stop receiving noisy packets
+    _notifySub?.cancel();
+    _notifySub = null;
+    // optionally stop device from streaming by sending a host packet if protocol defines one
+    // e.g., send a host "stop" command if you find it in the doc (left commented)
+    // final stopPkt = buildPacket(0x??, [0x00]); _writeWithResponse(stopPkt);
+
+    setState(() {
+      status = 'completed';
+      heartRate = result['hr'] as int?;
+    });
+
+    // show result dialog
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Measurement Complete'),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('HR: ${result['hr'] ?? '--'} bpm'),
+              const SizedBox(height: 6),
+              Text('Result: ${result['analysisText'] ?? '—'}'),
+              const SizedBox(height: 12),
+              Text('Timestamp: ${result['datetime']}'),
+              const SizedBox(height: 12),
+              Text('Samples saved: ${(result['samples'] as List).length}'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              // keep data in memory for later send/print
+            },
+            child: const Text('Close'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              // _saveResultToFile(result);
+              _appendLog('Result saved $result');
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _writeWithResponse(Uint8List bytes) async {
     if (_selected == null) return;
     try {
@@ -530,9 +593,28 @@ class _EcgHomePageState extends State<EcgHomePage> {
       case 0xAA:
         _handleDataFrame(data);
         break;
+      case 0x33:
+        _handleHandshake33(data);
+        break;
+
       default:
         _appendLog('Unknown token 0x${token.toRadixString(16)} len $len');
     }
+  }
+
+  void _handleHandshake33(List<int> data) async {
+    // 0x33: Device handshake packet per protocol
+    _appendLog('Handshake (0x33) from device, ${data.length} bytes');
+    // Usually the device expects host ACK: token 0x33, payload [0x00]
+    // Some docs specify host should echo the same token with 0x00
+    final ack = buildPacket(0x33, [0x00]);
+    await _writeWithResponse(ack);
+    _appendLog('Sent handshake ACK (0x33).');
+
+    // After handshake, you can query version to continue the init flow
+    final qVer = buildPacket(0x11, [0x00, 0x00, 0x00]);
+    await _writeWithResponse(qVer);
+    _appendLog('Sent version query (0x11).');
   }
 
   void _handleHeartbeat(List<int> data) {
@@ -633,9 +715,23 @@ class _EcgHomePageState extends State<EcgHomePage> {
       final hr = ecgBytes[7];
       final resultCode = ecgBytes[8];
       heartRate = hr;
+      final analysisText = _analysisText(resultCode);
+
       _appendLog(
         'Analysis: $year-$month-$day $hour:$minute:$second HR:$hr result:$resultCode ${_analysisText(resultCode)}',
       );
+      // Build result object
+      final result = {
+        'datetime': '$year-$month-$day $hour:$minute:$second',
+        'hr': hr,
+        'resultCode': resultCode,
+        'analysisText': analysisText,
+        'deviceId': _selected?.id ?? '',
+        'samples': collectedSamplesAll, // full recording (centered)
+      };
+
+      _onMeasurementComplete(result);
+
       final json = {
         'token': '0xDD',
         'analysis': {
@@ -703,6 +799,27 @@ class _EcgHomePageState extends State<EcgHomePage> {
       // ignore: avoid_print
       print(jsonEncode(json));
       setState(() {});
+      // after parsing samples
+      // detect end-of-measurement heuristic: many frames with all zero samples or hr==0
+      if (hr == 0) {
+        // increment a counter (add a state field _zeroFrameCount)
+        _zeroFrameCount = (_zeroFrameCount ?? 0) + 1;
+      } else {
+        _zeroFrameCount = 0;
+      }
+      if ((_zeroFrameCount ?? 0) >= 4) {
+        // 4 consecutive empty frames => end
+        final result = {
+          'datetime': DateTime.now().toIso8601String(),
+          'hr': heartRate ?? 0,
+          'resultCode': -1,
+          'analysisText': 'End detected (no analysis packet).',
+          'deviceId': _selected?.id ?? '',
+          'samples': collectedSamplesAll,
+        };
+        _onMeasurementComplete(result);
+        return;
+      }
     } else {
       // Possibly non-real-time data chunk (SCP) — we base64 it and log
       final json = {
@@ -717,11 +834,48 @@ class _EcgHomePageState extends State<EcgHomePage> {
   }
 
   void _pushSample(double mv) {
-    // push into rolling buffer, keep capacity
-    if (ecgBuffer.length >= bufferCapacity) {
-      ecgBuffer.removeFirst();
+    // ignore obviously invalid values (zeros or tiny noise) - device sometimes sends spurious zeros
+    if (mv <= 0.5) {
+      // small value — treat as gap; skip pushing but keep continuity
+      return;
     }
-    ecgBuffer.add(mv);
+    // clamp outliers (prevent single-sample spikes)
+    if (_baselineWindow.isNotEmpty) {
+      final baseline =
+          _baselineWindow.reduce((a, b) => a + b) / _baselineWindow.length;
+      if ((mv - baseline).abs() > 200.0) {
+        // 200 mV jump is suspicious, tune as needed
+        // ignore outlier
+        return;
+      }
+    }
+
+    // maintain baseline window (moving mean)
+    _baselineWindow.add(mv);
+    if (_baselineWindow.length > baselineWindowSize)
+      _baselineWindow.removeAt(0);
+    final baseline =
+        _baselineWindow.reduce((a, b) => a + b) / _baselineWindow.length;
+
+    // remove baseline (center waveform)
+    final centered = mv - baseline;
+
+    // smoothing (simple moving average)
+    // we'll keep a short buffer in collectedSamplesAll for smoothing
+    collectedSamplesAll.add(centered);
+    if (collectedSamplesAll.length >= smoothingWindow) {
+      // compute average of last N values to smooth
+      final start = collectedSamplesAll.length - smoothingWindow;
+      final window = collectedSamplesAll.sublist(start);
+      final avg = window.reduce((a, b) => a + b) / window.length;
+      // push into visible ecgBuffer as mV (you may want to scale)
+      if (ecgBuffer.length >= bufferCapacity) ecgBuffer.removeFirst();
+      ecgBuffer.add(avg);
+    } else {
+      // warm-up: push raw centered
+      if (ecgBuffer.length >= bufferCapacity) ecgBuffer.removeFirst();
+      ecgBuffer.add(centered);
+    }
   }
 
   String _decodeMeasureStatus(int b) {
@@ -895,6 +1049,30 @@ class _EcgHomePageState extends State<EcgHomePage> {
             ),
 
             const Divider(),
+            if (status == 'completed')
+              Card(
+                margin: const EdgeInsets.all(12),
+                child: ListTile(
+                  leading: const Icon(Icons.check_circle, color: Colors.green),
+                  title: Text('HR: ${heartRate ?? "--"} bpm'),
+                  subtitle: Text(
+                    'Measurement complete. Tap Save to store result.',
+                  ),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.save),
+                    onPressed: () {
+                      final res = {
+                        'hr': heartRate,
+                        'analysisText': measureState,
+                        'samples': collectedSamplesAll,
+                        'datetime': DateTime.now().toIso8601String(),
+                      };
+                      // _saveResultToFile(res);
+                      _appendLog('Result saved $res');
+                    },
+                  ),
+                ),
+              ),
 
             // logs
             Expanded(
