@@ -1,22 +1,319 @@
 // lib/main.dart
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
 
-void main() {
-  runApp(const MyApp());
+void main() => runApp(const MyApp());
+
+Uuid SERVICE_UUID = Uuid.parse("0000FFF0-0000-1000-8000-00805f9b34fb");
+Uuid CHAR_READ = Uuid.parse("0000FFF1-0000-1000-8000-00805f9b34fb");
+Uuid CHAR_WRITE = Uuid.parse("0000FFF2-0000-1000-8000-00805f9b34fb");
+
+// ----- CRC8-CCITT table from protocol Appendix A -----
+const List<int> _crc8Table = [
+  0x00,
+  0x5e,
+  0xbc,
+  0xe2,
+  0x61,
+  0x3f,
+  0xdd,
+  0x83,
+  0xc2,
+  0x9c,
+  0x7e,
+  0x20,
+  0xa3,
+  0xfd,
+  0x1f,
+  0x41,
+  0x9d,
+  0xc3,
+  0x21,
+  0x7f,
+  0xfc,
+  0xa2,
+  0x40,
+  0x1e,
+  0x5f,
+  0x01,
+  0xe3,
+  0xbd,
+  0x3e,
+  0x60,
+  0x82,
+  0xdc,
+  0x23,
+  0x7d,
+  0x9f,
+  0xc1,
+  0x42,
+  0x1c,
+  0xfe,
+  0xa0,
+  0xe1,
+  0xbf,
+  0x5d,
+  0x03,
+  0x80,
+  0xde,
+  0x3c,
+  0x62,
+  0xbe,
+  0xe0,
+  0x02,
+  0x5c,
+  0xdf,
+  0x81,
+  0x63,
+  0x3d,
+  0x7c,
+  0x22,
+  0xc0,
+  0x9e,
+  0x1d,
+  0x43,
+  0xa1,
+  0xff,
+  0x46,
+  0x18,
+  0xfa,
+  0xa4,
+  0x27,
+  0x79,
+  0x9b,
+  0xc5,
+  0x84,
+  0xda,
+  0x38,
+  0x66,
+  0xe5,
+  0xbb,
+  0x59,
+  0x07,
+  0xdb,
+  0x85,
+  0x67,
+  0x39,
+  0xba,
+  0xe4,
+  0x06,
+  0x58,
+  0x19,
+  0x47,
+  0xa5,
+  0xfb,
+  0x78,
+  0x26,
+  0xc4,
+  0x9a,
+  0x65,
+  0x3b,
+  0xd9,
+  0x87,
+  0x04,
+  0x5a,
+  0xb8,
+  0xe6,
+  0xa7,
+  0xf9,
+  0x1b,
+  0x45,
+  0xc6,
+  0x98,
+  0x7a,
+  0x24,
+  0xf8,
+  0xa6,
+  0x44,
+  0x1a,
+  0x99,
+  0xc7,
+  0x25,
+  0x7b,
+  0x3a,
+  0x64,
+  0x86,
+  0xd8,
+  0x5b,
+  0x05,
+  0xe7,
+  0xb9,
+  0x8c,
+  0xd2,
+  0x30,
+  0x6e,
+  0xed,
+  0xb3,
+  0x51,
+  0x0f,
+  0x4e,
+  0x10,
+  0xf2,
+  0xac,
+  0x2f,
+  0x71,
+  0x93,
+  0xcd,
+  0x11,
+  0x4f,
+  0xad,
+  0xf3,
+  0x70,
+  0x2e,
+  0xcc,
+  0x92,
+  0xd3,
+  0x8d,
+  0x6f,
+  0x31,
+  0xb2,
+  0xec,
+  0x0e,
+  0x50,
+  0xaf,
+  0xf1,
+  0x13,
+  0x4d,
+  0xce,
+  0x90,
+  0x72,
+  0x2c,
+  0x6d,
+  0x33,
+  0xd1,
+  0x8f,
+  0x0c,
+  0x52,
+  0xb0,
+  0xee,
+  0x32,
+  0x6c,
+  0x8e,
+  0xd0,
+  0x53,
+  0x0d,
+  0xef,
+  0xb1,
+  0xf0,
+  0xae,
+  0x4c,
+  0x12,
+  0x91,
+  0xcf,
+  0x2d,
+  0x73,
+  0xca,
+  0x94,
+  0x76,
+  0x28,
+  0xab,
+  0xf5,
+  0x17,
+  0x49,
+  0x08,
+  0x56,
+  0xb4,
+  0xea,
+  0x69,
+  0x37,
+  0xd5,
+  0x8b,
+  0x57,
+  0x09,
+  0xeb,
+  0xb5,
+  0x36,
+  0x68,
+  0x8a,
+  0xd4,
+  0x95,
+  0xcb,
+  0x29,
+  0x77,
+  0xf4,
+  0xaa,
+  0x48,
+  0x16,
+  0xe9,
+  0xb7,
+  0x55,
+  0x0b,
+  0x88,
+  0xd6,
+  0x34,
+  0x6a,
+  0x2b,
+  0x75,
+  0x97,
+  0xc9,
+  0x4a,
+  0x14,
+  0xf6,
+  0xa8,
+  0x74,
+  0x2a,
+  0xc8,
+  0x96,
+  0x15,
+  0x4b,
+  0xa9,
+  0xf7,
+  0xb6,
+  0xe8,
+  0x0a,
+  0x54,
+  0xd7,
+  0x89,
+  0x6b,
+  0x35,
+];
+
+int crc8Ccitt(List<int> bytes) {
+  int crc = 0x00;
+  for (final b in bytes) {
+    crc = _crc8Table[(crc ^ (b & 0xFF)) & 0xFF];
+  }
+  return crc & 0xFF;
 }
 
+// ----- Helper utilities -----
+Uint8List buildPacket(int token, List<int> data) {
+  final buf = <int>[];
+  buf.add(0xA5);
+  buf.add(token & 0xFF);
+  buf.add(data.length & 0xFF);
+  buf.addAll(data);
+  final c = crc8Ccitt(buf);
+  buf.add(c);
+  return Uint8List.fromList(buf);
+}
+
+bool validatePacket(List<int> packet) {
+  if (packet.length < 4) return false;
+  final payload = packet.sublist(0, packet.length - 1);
+  final crc = packet.last & 0xFF;
+  return crc8Ccitt(payload) == crc;
+}
+
+// ----- App -----
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
   @override
-  Widget build(BuildContext context) => MaterialApp(
-    title: 'PC-80B BLE ECG',
-    theme: ThemeData.dark(),
-    home: const EcgHomePage(),
-  );
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'PC-80B ECG',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData.dark().copyWith(
+        scaffoldBackgroundColor: const Color(0xFF0B0B10),
+        primaryColor: Colors.greenAccent,
+      ),
+      home: const EcgHomePage(),
+    );
+  }
 }
 
 class EcgHomePage extends StatefulWidget {
@@ -26,64 +323,82 @@ class EcgHomePage extends StatefulWidget {
 }
 
 class _EcgHomePageState extends State<EcgHomePage> {
-  final flutterReactiveBle = FlutterReactiveBle();
-  final _scanStream = StreamController<DiscoveredDevice>.broadcast();
-  final _log = <String>[];
-  late final Uuid serviceUuid;
-  late final Uuid charReadUuid;
-  late final Uuid charWriteUuid;
-
-  DiscoveredDevice? _selectedDevice;
-  StreamSubscription<ConnectionStateUpdate>? _connection;
+  final _ble = FlutterReactiveBle();
+  final _scanController = StreamController<DiscoveredDevice>.broadcast();
+  final List<String> _log = [];
+  final List<int> _recvBuffer = [];
+  StreamSubscription<ConnectionStateUpdate>? _connSub;
   StreamSubscription<List<int>>? _notifySub;
-
-  // streaming parser buffer
-  final List<int> _buffer = [];
-
-  // UI fields
-  int? heartRate;
+  DiscoveredDevice? _selected;
   String status = 'idle';
-  List<int> latestSamples = [];
+
+  // ECG rolling buffer (samples in ADC counts)
+  final ListQueue<double> ecgBuffer = ListQueue(); // store as millivolts
+  final int samplingHz = 150;
+  final double secondsToShow = 5.0;
+  late final int bufferCapacity;
+
+  // current metrics
+  int? heartRate;
+  bool leadOff = false;
+  double batteryMv = 0.0;
+  String measureState = 'idle';
+
+  // conversion (tweak this to calibrate -> mV)
+  double adcToMv = 0.1; // initial guess: 1 count => 0.1 mV. Adjust as needed.
 
   @override
   void initState() {
     super.initState();
-    serviceUuid = Uuid.parse("0000FFF0-0000-1000-8000-00805f9b34fb");
-    charReadUuid = Uuid.parse("0000FFF1-0000-1000-8000-00805f9b34fb");
-    charWriteUuid = Uuid.parse("0000FFF2-0000-1000-8000-00805f9b34fb");
+    bufferCapacity = (samplingHz * secondsToShow).toInt(); // e.g., 750
   }
 
   @override
   void dispose() {
-    _scanStream.close();
-    _connection?.cancel();
+    _scanController.close();
+    _connSub?.cancel();
     _notifySub?.cancel();
     super.dispose();
   }
 
-  void _appendLog(String s) {
+  void _appendLog(String text) {
+    final t = "${DateTime.now().toIso8601String()} $text";
     setState(() {
-      _log.insert(0, "${DateTime.now().toIso8601String()} $s");
-      if (_log.length > 200) _log.removeLast();
+      _log.insert(0, t);
+      if (_log.length > 300) _log.removeLast();
     });
+    // also print JSON / human-readable to console for debug
+    // ignore: avoid_print
+    print(t);
   }
 
   Future<void> scanForDevices() async {
-    _appendLog('Start scanning for PC80B...');
-    setState(() => status = 'scanning');
-    flutterReactiveBle
+    _appendLog('Scan start...');
+    setState(() {
+      status = 'scanning';
+      _selected = null;
+    });
+    final seen = <String>{};
+
+    _ble
         .scanForDevices(
-          withServices: [serviceUuid],
+          withServices: [SERVICE_UUID],
           scanMode: ScanMode.lowLatency,
         )
         .listen(
           (device) {
-            // pick devices that look like PC80B (advertised name may contain PC80B)
-            if ((device.name?.contains('PC80B') ?? false) ||
-                (device.name?.contains('PC-80B') ?? false) ||
-                device.serviceUuids.contains(serviceUuid)) {
-              _appendLog('Found device: ${device.name} ${device.id}');
-              _scanStream.add(device);
+            if (seen.contains(device.id)) return;
+            seen.add(device.id);
+            if ((device.name?.isNotEmpty ?? false) ||
+                device.serviceUuids.contains(SERVICE_UUID)) {
+              _appendLog('Found ${device.name} (${device.id})');
+
+              if (_selected == null || _selected!.id != device.id) {
+                setState(() {
+                  _selected = device;
+                });
+              }
+              _scanController.add(device);
             }
           },
           onError: (e) {
@@ -93,34 +408,35 @@ class _EcgHomePageState extends State<EcgHomePage> {
         );
   }
 
-  Future<void> connectTo(DiscoveredDevice device) async {
-    _appendLog('Connecting to ${device.name} ${device.id}');
+  Future<void> connectTo(DiscoveredDevice dev) async {
+    _appendLog('Connecting to ${dev.name}');
     setState(() {
       status = 'connecting';
-      _selectedDevice = device;
+      _selected = dev;
     });
-
-    _connection?.cancel();
-    _connection = flutterReactiveBle
+    _connSub?.cancel();
+    _connSub = _ble
         .connectToDevice(
-          id: device.id,
+          id: dev.id,
           connectionTimeout: const Duration(seconds: 8),
         )
         .listen(
-          (event) async {
-            _appendLog('Connection state: ${event.connectionState}');
-            if (event.connectionState == DeviceConnectionState.connected) {
+          (update) {
+            _appendLog('ConnState: ${update.connectionState}');
+            if (update.connectionState == DeviceConnectionState.connected) {
               setState(() => status = 'connected');
-              // subscribe to notifications
               _subscribeNotifications();
-              // send query version packet to handshake
-              _sendQueryVersion();
-            } else if (event.connectionState ==
+              // send version query per protocol
+              final q = buildPacket(0x11, [0x00, 0x00, 0x00]);
+              _writeWithResponse(q);
+              // send heartbeat timer optionally
+            } else if (update.connectionState ==
                 DeviceConnectionState.disconnected) {
-              _appendLog('Disconnected.');
+              _appendLog('Disconnected');
+              _notifySub?.cancel();
               setState(() {
                 status = 'disconnected';
-                _selectedDevice = null;
+                _selected = null;
               });
             }
           },
@@ -131,144 +447,66 @@ class _EcgHomePageState extends State<EcgHomePage> {
         );
   }
 
-  // === Packet helpers ===
-
-  /// Build packet: Head(0xA5) Token Length Data CRC
-  Uint8List buildPacket(int token, List<int> data) {
-    final len = data.length;
-    final buf = <int>[];
-    buf.add(0xA5);
-    buf.add(token & 0xFF);
-    buf.add(len & 0xFF);
-    buf.addAll(data);
-    final crc = computeCrc(buf); // CRC over Head..end of data
-    buf.add(crc);
-    return Uint8List.fromList(buf);
+  Future<void> _writeWithResponse(Uint8List bytes) async {
+    if (_selected == null) return;
+    try {
+      await _ble.writeCharacteristicWithResponse(
+        QualifiedCharacteristic(
+          deviceId: _selected!.id,
+          serviceId: SERVICE_UUID,
+          characteristicId: CHAR_WRITE,
+        ),
+        value: bytes,
+      );
+    } catch (e) {
+      _appendLog('Write error: $e');
+    }
   }
-
-  /// Default CRC: simple sum & 0xFF. If your device uses CRC-8 polynomial,
-  /// replace computeCrc with the CRC-8 (poly=0x07) routine.
-  int computeCrc(List<int> bytes) {
-    // sum & 0xFF
-    int s = 0;
-    for (final b in bytes) s = (s + (b & 0xFF)) & 0xFF;
-    return s;
-  }
-
-  bool validateCrc(List<int> packetBytes) {
-    if (packetBytes.length < 4)
-      return false; // must include head token len crc minimally
-    final crcReceived = packetBytes.last;
-    final payload = packetBytes.sublist(0, packetBytes.length - 1);
-    final c = computeCrc(payload);
-    return (c & 0xFF) == (crcReceived & 0xFF);
-  }
-
-  // === Send handshake/query ===
-
-  void _sendQueryVersion() async {
-    if (_selectedDevice == null) return;
-    final q = buildPacket(0x11, [
-      0x00,
-      0x00,
-      0x00,
-    ]); // Host query packet sample (3 reserved bytes)
-    await flutterReactiveBle.writeCharacteristicWithResponse(
-      QualifiedCharacteristic(
-        characteristicId: charWriteUuid,
-        serviceId: serviceUuid,
-        deviceId: _selectedDevice!.id,
-      ),
-      value: q,
-    );
-    _appendLog('Sent version query (0x11).');
-  }
-
-  void _sendConfigRealTime() async {
-    // Device Model 0x80, Filter+Type: 0x00 = real-time, Device ID 12 bytes (all zeros if unknown)
-    final deviceId = List<int>.filled(12, 0x00);
-    final payload =
-        <int>[0x80, 0x00] +
-        deviceId; // length 14? protocol says 0x0E length (14)
-    final packet = buildPacket(0x55, payload);
-    await flutterReactiveBle.writeCharacteristicWithResponse(
-      QualifiedCharacteristic(
-        characteristicId: charWriteUuid,
-        serviceId: serviceUuid,
-        deviceId: _selectedDevice!.id,
-      ),
-      value: packet,
-    );
-    _appendLog('Sent config (0x55) real-time request.');
-  }
-
-  // === Subscribe to incoming notifications ===
 
   void _subscribeNotifications() {
-    if (_selectedDevice == null) return;
+    if (_selected == null) return;
     _notifySub?.cancel();
     final char = QualifiedCharacteristic(
-      characteristicId: charReadUuid,
-      serviceId: serviceUuid,
-      deviceId: _selectedDevice!.id,
+      deviceId: _selected!.id,
+      serviceId: SERVICE_UUID,
+      characteristicId: CHAR_READ,
     );
-    _notifySub = flutterReactiveBle
-        .subscribeToCharacteristic(char)
-        .listen(
-          (data) {
-            // data is List<int>
-            _appendLog('raw received ${data.length} bytes');
-            _feedBytes(data);
-          },
-          onError: (e) {
-            _appendLog('Notification error: $e');
-          },
-        );
+    _notifySub = _ble.subscribeToCharacteristic(char).listen((data) {
+      _appendLog('raw ${data.length} bytes');
+      _feedBytes(data);
+    }, onError: (e) => _appendLog('Notify error: $e'));
   }
 
-  // Feed the streaming bytes into parser buffer and attempt to parse packets
+  // feed bytes into buffer and try to parse packets
   void _feedBytes(List<int> bytes) {
-    _buffer.addAll(bytes);
-    _parseBuffer();
+    _recvBuffer.addAll(bytes);
+    _tryParseBuffer();
   }
 
-  void _parseBuffer() {
-    // Loop trying to extract full packets
+  void _tryParseBuffer() {
     while (true) {
-      if (_buffer.length < 4) return; // need at least head, token, len, crc
-      // find head 0xA5
-      int headIndex = _buffer.indexOf(0xA5);
+      if (_recvBuffer.length < 4) return;
+      final headIndex = _recvBuffer.indexOf(0xA5);
       if (headIndex == -1) {
-        _buffer.clear();
+        _recvBuffer.clear();
         return;
       }
       if (headIndex > 0) {
-        // drop bytes before head
-        _buffer.removeRange(0, headIndex);
+        _recvBuffer.removeRange(0, headIndex);
+        if (_recvBuffer.length < 4) return;
       }
-      if (_buffer.length < 4) return;
-      final token = _buffer[1];
-      final len = _buffer[2];
-      final totalLen = 3 + len + 1; // head+token+len + data(len) + crc(1)
-      if (_buffer.length < totalLen) return; // wait for more bytes
-      final packet = _buffer.sublist(0, totalLen);
-      // remove packet from buffer
-      _buffer.removeRange(0, totalLen);
-
-      // validate CRC
-      if (!validateCrc(packet)) {
-        _appendLog(
-          'CRC failed for token 0x${token.toRadixString(16)}. Dropping packet.',
-        );
+      if (_recvBuffer.length < 4) return;
+      final token = _recvBuffer[1];
+      final len = _recvBuffer[2];
+      final total = 3 + len + 1;
+      if (_recvBuffer.length < total) return; // wait
+      final packet = _recvBuffer.sublist(0, total);
+      _recvBuffer.removeRange(0, total);
+      if (!validatePacket(packet)) {
+        _appendLog('CRC fail token 0x${token.toRadixString(16)} dropping');
         continue;
       }
-
-      // parse by token
-      try {
-        _handlePacket(Uint8List.fromList(packet));
-      } catch (e) {
-        _appendLog('Packet parse error: $e');
-      }
+      _handlePacket(Uint8List.fromList(packet));
     }
   }
 
@@ -278,277 +516,480 @@ class _EcgHomePageState extends State<EcgHomePage> {
     final data = packet.sublist(3, 3 + len);
     switch (token) {
       case 0xFF:
-        // heartbeat
-        _appendLog('Heartbeat received.');
+        _handleHeartbeat(data);
         break;
       case 0x11:
-        // version reply
-        final ver = data
-            .map((b) => b.toRadixString(16).padLeft(2, '0'))
-            .join(' ');
-        _appendLog('Version packet: $ver');
+        _handleVersionReply(data);
         break;
       case 0x55:
-        // configuration from device
-        _appendLog('Config packet from device: ${data.length} bytes');
-        // parse device model, filter/trans type, device id(12)
-        if (data.length >= 14) {
-          final devModel = data[0];
-          final filterAndType = data[1];
-          final devId = data.sublist(2, 14);
-          final json = {
-            'token': '0x55',
-            'deviceModel': devModel,
-            'filterAndType': filterAndType,
-            'deviceId': base64Encode(devId),
-          };
-          _appendLog('Config JSON: ${jsonEncode(json)}');
-        }
+        _handleConfig(data); // either request from device or ack response
         break;
       case 0xDD:
-        // real-time tracking packet (used during tracking mode)
-        _parseTracking(data);
+        _handleTracking(data);
         break;
       case 0xAA:
-        // data frame (non-real-time / data dump or real-time frames depending on session)
-        _parseDataFrame(data);
+        _handleDataFrame(data);
         break;
       default:
-        _appendLog('Unhandled token 0x${token.toRadixString(16)} len $len');
+        _appendLog('Unknown token 0x${token.toRadixString(16)} len $len');
     }
   }
 
-  void _parseTracking(Uint8List data) {
-    // Format per protocol: SegNo(1), Info(2), MeasurementStatus(1), ECGdesc(2), ECG data (0..)
+  void _handleHeartbeat(List<int> data) {
+    // data[0] incidental info: battery level in low nibble
+    if (data.isNotEmpty) {
+      final info = data[0];
+      final batLevel = info & 0x0F;
+      // map 0..3 to levels — not exact voltage. We'll show level
+      setState(() {
+        batteryMv =
+            0.0; // unknown exact mV from this byte; real battery mV comes in data frames
+      });
+      _appendLog('Heartbeat: level $batLevel');
+    } else {
+      _appendLog('Heartbeat (no incidental info)');
+    }
+  }
+
+  void _handleVersionReply(List<int> data) {
+    // device responds with version bytes (BCD etc.)
+    _appendLog(
+      'Version reply: ${data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}',
+    );
+  }
+
+  void _handleConfig(List<int> data) {
+    // config packet: DeviceModel(1), Filter+Type(1), DeviceID(12)
+    if (data.length >= 14) {
+      final model = data[0];
+      final filterType = data[1];
+      final deviceId = data.sublist(2, 14);
+      final json = {
+        'token': '0x55',
+        'deviceModel': model,
+        'filterType': filterType,
+        'deviceId': deviceId
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join(),
+      };
+      _appendLog('Config: ${jsonEncode(json)}');
+      // send ACK to device to confirm config received
+      final ack = buildPacket(0x55, [0x00]); // ACK=0x00
+      _writeWithResponse(ack);
+    } else if (data.length == 1) {
+      // Host response when host responds to device config
+      final code = data[0];
+      _appendLog('Config response from host code=$code');
+    }
+  }
+
+  void _handleTracking(Uint8List data) {
+    // SegNo(1), Info(2 little endian), MeasurementStatus(1), ECGdesc(2), ECG data...
     if (data.length < 6) {
-      _appendLog('Tracking packet too short: ${data.length}');
+      _appendLog('Tracking too short ${data.length}');
       return;
     }
-    int segNo = data[0];
-    int infoLow = data[1];
-    int infoHigh = data[2];
-    int info = (infoHigh << 8) | infoLow;
-    int measStatus = data[3];
-    int ecgDescLow = data[4];
-    int ecgDescHigh = data[5];
-    int ecgDesc = (ecgDescHigh << 8) | ecgDescLow;
+    final segNo = data[0];
+    final info = (data[2] << 8) | data[1];
+    final measStatus = data[3];
+    final ecgDesc = (data[5] << 8) | data[4];
+    measureState = _decodeMeasureStatus(measStatus);
+    // ecgDesc bits: bit15 lead off, bits10-8 data structure
+    final leadOffFlag = ((ecgDesc & 0x8000) != 0);
+    final dataStruct = (ecgDesc >> 8) & 0x07; // bits10-8
+    leadOff = leadOffFlag;
+    // Ecg data follows
     final ecgBytes = data.sublist(6);
-    // If ecgDesc indicates structure-1 => 25 sampling points, each 2 bytes little endian
-    List<int> samples = [];
-    if (ecgBytes.length >= 50) {
+    if (dataStruct == 1 && ecgBytes.length >= 50) {
+      // 25 samples (2 bytes each)
+      final samples = <double>[];
       for (int i = 0; i + 1 < ecgBytes.length && samples.length < 25; i += 2) {
         int v = (ecgBytes[i + 1] << 8) | ecgBytes[i];
-        // lower 12 bits valid per doc
-        v &= 0x0FFF;
-        samples.add(v);
+        v &= 0x0FFF; // lower 12 bits valid
+        final mv = v * adcToMv;
+        samples.add(mv);
+        _pushSample(mv);
       }
+      _appendLog(
+        'Tracking seg:$segNo struct1 samples:${samples.length} state:$measureState',
+      );
+      // print JSON
+      final json = {
+        'token': '0xDD',
+        'seg': segNo,
+        'state': measureState,
+        'samples': samples,
+      };
+      // ignore: avoid_print
+      print(jsonEncode(json));
+    } else if (dataStruct == 2 && ecgBytes.length >= 9) {
+      // analysis result: year month day hour minute second HR result
+      final year = ((ecgBytes[0] << 8) | ecgBytes[1]);
+      final month = ecgBytes[2];
+      final day = ecgBytes[3];
+      final hour = ecgBytes[4];
+      final minute = ecgBytes[5];
+      final second = ecgBytes[6];
+      final hr = ecgBytes[7];
+      final resultCode = ecgBytes[8];
+      heartRate = hr;
+      _appendLog(
+        'Analysis: $year-$month-$day $hour:$minute:$second HR:$hr result:$resultCode ${_analysisText(resultCode)}',
+      );
+      final json = {
+        'token': '0xDD',
+        'analysis': {
+          'datetime': '$year-$month-$day $hour:$minute:$second',
+          'hr': hr,
+          'result': resultCode,
+        },
+      };
+      // ignore: avoid_print
+      print(jsonEncode(json));
+    } else {
+      _appendLog('Tracking struct:$dataStruct bytes:${ecgBytes.length}');
     }
-    // Some tracking packets contain analysis result (structure-2) with time/HR/result
-    Map<String, dynamic> parsed = {
-      'token': '0xDD',
-      'segNo': segNo,
-      'info': info,
-      'measStatus': measStatus,
-      'ecgDesc': ecgDesc,
-      'samplesCount': samples.length,
-      'samplesBase64': base64Encode(
-        Uint8List.fromList(
-          samples.expand((s) {
-            // pack each sample as 2 bytes little endian for storage
-            final lo = s & 0xFF;
-            final hi = (s >> 8) & 0xFF;
-            return [lo, hi];
-          }).toList(),
-        ),
-      ),
-    };
-    // If HR is embedded in analysis result later, we will parse that too
-    _appendLog('Tracking JSON: ${jsonEncode(parsed)}');
-    setState(() {
-      latestSamples = samples;
-    });
+    setState(() {});
   }
 
-  void _parseDataFrame(Uint8List data) {
-    // Data frame begins with frame sequence number, then data block (SCP or real-time packet per session)
+  void _handleDataFrame(Uint8List data) {
+    // Data frame: seq(1) followed by payload
     if (data.isEmpty) return;
     final seq = data[0];
     final payload = data.sublist(1);
-    // If this session is real-time streaming as defined in 4.2.2, the packet was token 0x55 with 0x36 length;
-    // but some devices may send 0xAA for data frames. We'll attempt to detect 25*2+3 pattern.
-    if (payload.length >= 25 * 2 + 3) {
-      // interpret as waves: first 25*2 bytes = 25 samples
-      List<int> samples = [];
-      for (int i = 0; i + 1 < payload.length && samples.length < 25; i += 2) {
-        int v = (payload[i + 1] << 8) | payload[i];
-        v &= 0x0FFF;
-        samples.add(v);
+    // For real-time upload (protocol 4.2.2), the device sends 25 points (25*2 bytes) + HR(1) + lead&battery(2) total length 25*2+3 = 53
+    if (payload.length >= (25 * 2 + 3)) {
+      final samples = <double>[];
+      for (int i = 0; i < 25; i++) {
+        final lo = payload[i * 2];
+        final hi = payload[i * 2 + 1];
+        int val = (hi << 8) | lo;
+        val &= 0x0FFF;
+        final mv = val * adcToMv;
+        samples.add(mv);
+        _pushSample(mv);
       }
-      // last 3 bytes might be HR (1), lead status (1), battery (1 or 2)
-      int hr = (payload.length > 25 * 2) ? payload[25 * 2] : 0;
-      int leadStatus = (payload.length > 25 * 2 + 1) ? payload[25 * 2 + 1] : 0;
-      int battery = (payload.length > 25 * 2 + 2) ? payload[25 * 2 + 2] : 0;
+      // trailing bytes
+      final hr = payload[25 * 2];
+      final leadBatteryLow = payload[25 * 2 + 1];
+      final leadBatteryHigh = payload[25 * 2 + 2];
+      final leadBattery =
+          (leadBatteryHigh << 8) |
+          leadBatteryLow; // little endian note in doc: high after low
+      final leadFlag = ((leadBattery & 0x8000) != 0);
+      final batteryVal =
+          (leadBattery &
+          0x0FFF); // bits 11..0 represent battery (unit: mV per doc)
+      // Build readable metrics
+      heartRate = hr;
+      leadOff = leadFlag;
+      // batteryVal unit per doc is mV (they said unit MV but it is mV likely). We'll treat as mV.
+      batteryMv = batteryVal.toDouble();
+      // ACK back to device for real-time packet (Host should respond with ACK)
+      final ackPacket = buildPacket(0xAA, [seq, 0x00]); // seq + ACK(0x00)
+      _writeWithResponse(ackPacket);
       final json = {
         'token': '0xAA',
         'seq': seq,
         'hr': hr,
-        'leadStatus': leadStatus,
-        'battery': battery,
-        'samples': samples,
+        'leadOff': leadOff,
+        'battery_mV': batteryMv,
+        'samples_mV': samples,
       };
-      _appendLog('Realtime samples JSON: ${jsonEncode(json)}');
-      setState(() {
-        heartRate = hr;
-        latestSamples = samples;
-      });
+      _appendLog(
+        'Realtime seq:$seq HR:$hr battery:${batteryMv.toStringAsFixed(0)}mV lead:${leadOff ? "OFF" : "ON"}',
+      );
+      // large sample JSON to console
+      // ignore: avoid_print
+      print(jsonEncode(json));
+      setState(() {});
     } else {
-      // treat as chunk of SCP file / binary; base64 it
+      // Possibly non-real-time data chunk (SCP) — we base64 it and log
       final json = {
         'token': '0xAA',
         'seq': seq,
         'payloadBase64': base64Encode(payload),
       };
-      _appendLog('Data chunk JSON: ${jsonEncode(json)}');
+      _appendLog('Data chunk seq:$seq size:${payload.length}');
+      // ignore: avoid_print
+      print(jsonEncode(json));
     }
   }
 
-  // UI & controls
+  void _pushSample(double mv) {
+    // push into rolling buffer, keep capacity
+    if (ecgBuffer.length >= bufferCapacity) {
+      ecgBuffer.removeFirst();
+    }
+    ecgBuffer.add(mv);
+  }
 
+  String _decodeMeasureStatus(int b) {
+    // bit7..6 channel, bit5..4 measure mode, bit3..0 stage
+    final stage = b & 0x0F;
+    switch (stage) {
+      case 0:
+        return 'detecting';
+      case 1:
+        return 'preparing';
+      case 2:
+        return 'measuring';
+      case 3:
+        return 'analysing';
+      case 4:
+        return 'reporting';
+      case 5:
+        return 'tracking_end';
+      default:
+        return 'stage_$stage';
+    }
+  }
+
+  String _analysisText(int code) {
+    // Appendix B mapping
+    const mapping = {
+      0: 'No irregular rhythm found',
+      1: 'Suspected a little fast beat',
+      2: 'Suspected fast beat',
+      3: 'Suspected short run of fast beat',
+      4: 'Suspected a little slow beat',
+      5: 'Suspected slow beat',
+      6: 'Suspected short beat interval',
+      7: 'Suspected irregular beat interval',
+      8: 'Suspected fast beat with short beat interval',
+      9: 'Suspected slow beat with short beat interval',
+      10: 'Suspected slow beat with irregular beat interval',
+      11: 'Waveform baseline wander',
+      12: 'Suspected fast beat with baseline wander',
+      13: 'Suspected slow beat with baseline wander',
+      14: 'Suspected short beat interval with baseline wander',
+      15: 'Suspected irregular beat interval with baseline wander',
+      16: 'Poor Signal, please try again',
+    };
+    return mapping[code] ?? 'Result $code';
+  }
+
+  // UI actions
+  void requestRealTime() {
+    // Send config: Device Model 0x80, TransmissionType 0x00, Device ID 12 zeros (or you can read deviceId earlier)
+    final deviceId = List<int>.filled(12, 0x00);
+    final payload = <int>[0x80, 0x00] + deviceId;
+    final packet = buildPacket(0x55, payload);
+    _writeWithResponse(packet);
+    _appendLog('Requested real-time (0x55) sent.');
+  }
+
+  // Build UI
   @override
   Widget build(BuildContext context) {
+    final samples = ecgBuffer.toList();
     return Scaffold(
-      appBar: AppBar(title: const Text('PC-80B BLE ECG')),
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.all(8.0),
-            child: Wrap(
-              spacing: 8,
-              children: [
-                ElevatedButton.icon(
-                  onPressed: scanForDevices,
-                  icon: const Icon(Icons.search),
-                  label: const Text('Scan BLE'),
-                ),
-                ElevatedButton.icon(
-                  onPressed: _selectedDevice == null
-                      ? null
-                      : () => connectTo(_selectedDevice!),
-                  icon: const Icon(Icons.bluetooth_connected),
-                  label: const Text('Connect Selected'),
-                ),
-                ElevatedButton.icon(
-                  onPressed: _selectedDevice == null
-                      ? null
-                      : _sendConfigRealTime,
-                  icon: const Icon(Icons.settings_remote),
-                  label: const Text('Request Real-Time'),
-                ),
-              ],
-            ),
-          ),
-          Expanded(
-            child: Row(
-              children: [
-                Expanded(
-                  flex: 2,
-                  child: Column(
+      appBar: AppBar(title: const Text('PC-80B - Live ECG')),
+      body: SafeArea(
+        child: Column(
+          children: [
+            // top controls & metrics
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Row(
+                children: [
+                  ElevatedButton.icon(
+                    icon: const Icon(Icons.search),
+                    label: const Text('Scan'),
+                    onPressed: scanForDevices,
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton.icon(
+                    icon: const Icon(Icons.bluetooth_connected),
+                    label: const Text('Connect'),
+                    onPressed: _selected == null
+                        ? null
+                        : () => connectTo(_selected!),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton.icon(
+                    icon: const Icon(Icons.stream),
+                    label: const Text('Request Real-Time'),
+                    onPressed: _selected == null ? null : requestRealTime,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Status: $status',
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                        Text(
+                          'Measure: $measureState',
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
-                      const Text('Discovered devices:'),
-                      Expanded(
-                        child: StreamBuilder<DiscoveredDevice>(
-                          stream: _scanStream.stream,
-                          builder: (context, snap) {
-                            final list = <DiscoveredDevice>[];
-                            if (snap.hasData) list.add(snap.data!);
-                            return ListView(
-                              children: list
-                                  .map(
-                                    (d) => ListTile(
-                                      title: Text(
-                                        d.name.isEmpty ? d.id : d.name,
-                                      ),
-                                      subtitle: Text(d.id),
-                                      onTap: () =>
-                                          setState(() => _selectedDevice = d),
-                                      selected: _selectedDevice?.id == d.id,
-                                    ),
-                                  )
-                                  .toList(),
-                            );
-                          },
+                      Text(
+                        'HR: ${heartRate ?? "--"} bpm',
+                        style: const TextStyle(
+                          fontSize: 18,
+                          color: Colors.greenAccent,
+                        ),
+                      ),
+                      Text(
+                        'Battery: ${batteryMv > 0 ? "${batteryMv.toStringAsFixed(0)} mV" : "--"}',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                      Text(
+                        leadOff ? "Touch electrodes to start" : "Signal OK",
+                        style: TextStyle(
+                          color: leadOff
+                              ? Colors.redAccent
+                              : Colors.greenAccent,
                         ),
                       ),
                     ],
                   ),
+                ],
+              ),
+            ),
+
+            // waveform
+            Card(
+              margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              color: const Color(0xFF081010),
+              child: SizedBox(
+                height: 220,
+                child: Padding(
+                  padding: const EdgeInsets.all(8.0),
+                  child: CustomPaint(
+                    painter: EcgPainter(samples),
+                    child: Container(),
+                  ),
                 ),
-                Expanded(
-                  flex: 3,
-                  child: Column(
-                    children: [
-                      Text('Status: $status HR: ${heartRate ?? '--'}'),
-                      if (latestSamples.isNotEmpty)
-                        SizedBox(
-                          height: 120,
-                          child: CustomPaint(
-                            painter: WavePainter(latestSamples),
-                            size: const Size(double.infinity, 120),
-                          ),
+              ),
+            ),
+
+            // controls: scale adjust
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12.0),
+              child: Row(
+                children: [
+                  const Text('ADC→mV scale:'),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Slider(
+                      value: adcToMv,
+                      min: 0.01,
+                      max: 1.0,
+                      divisions: 99,
+                      label: adcToMv.toStringAsFixed(2),
+                      onChanged: (v) => setState(() => adcToMv = v),
+                    ),
+                  ),
+                  Text(adcToMv.toStringAsFixed(2)),
+                ],
+              ),
+            ),
+
+            const Divider(),
+
+            // logs
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Column(
+                  children: [
+                    const Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        'Log (latest):',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Expanded(
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: Colors.black,
+                          borderRadius: BorderRadius.circular(6),
                         ),
-                      const Divider(),
-                      const Text('Log:'),
-                      Expanded(
                         child: ListView.builder(
                           reverse: true,
                           itemCount: _log.length,
-                          itemBuilder: (c, i) => Text(
-                            _log[i],
-                            style: const TextStyle(fontSize: 12),
+                          itemBuilder: (c, i) => Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 4,
+                            ),
+                            child: Text(
+                              _log[i],
+                              style: const TextStyle(fontSize: 11),
+                            ),
                           ),
                         ),
                       ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
-              ],
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
 }
 
-class WavePainter extends CustomPainter {
-  final List<int> samples;
-  WavePainter(this.samples);
+// Painter: draws waveform in green, smooth polyline
+class EcgPainter extends CustomPainter {
+  final List<double> samplesMv;
+  EcgPainter(this.samplesMv);
   @override
   void paint(Canvas canvas, Size size) {
+    final bg = Paint()..color = const Color(0xFF061010);
+    canvas.drawRect(Offset.zero & size, bg);
+
+    if (samplesMv.isEmpty) return;
+
     final paint = Paint()
-      ..strokeWidth = 1.0
-      ..style = PaintingStyle.stroke;
-    if (samples.isEmpty) return;
-    final double w = size.width;
-    final double h = size.height;
-    final int n = samples.length;
-    final double step = w / (n - 1);
-    final maxVal = samples.reduce((a, b) => a > b ? a : b);
-    final minVal = samples.reduce((a, b) => a < b ? a : b);
-    final range = (maxVal - minVal).toDouble();
+      ..color = Colors.greenAccent
+      ..strokeWidth = 1.4
+      ..style = PaintingStyle.stroke
+      ..isAntiAlias = true;
+
+    // scale samples to fit vertical space
+    final maxVal = samplesMv.reduce((a, b) => a > b ? a : b);
+    final minVal = samplesMv.reduce((a, b) => a < b ? a : b);
+    final range = (maxVal - minVal) == 0 ? 1.0 : (maxVal - minVal);
+    final n = samplesMv.length;
+    final stepX = size.width / (n - 1).clamp(1, double.infinity);
     final path = Path();
     for (int i = 0; i < n; i++) {
-      final x = step * i;
-      final normalized = range == 0 ? 0.5 : (samples[i] - minVal) / range;
-      final y = h - normalized * h;
+      final x = i * stepX;
+      final normalized = (samplesMv[i] - minVal) / range;
+      final y = size.height - normalized * size.height;
       if (i == 0)
         path.moveTo(x, y);
       else
         path.lineTo(x, y);
     }
     canvas.drawPath(path, paint);
+
+    // draw midline
+    final midPaint = Paint()
+      ..color = Colors.white24
+      ..strokeWidth = 0.5;
+    canvas.drawLine(
+      Offset(0, size.height / 2),
+      Offset(size.width, size.height / 2),
+      midPaint,
+    );
   }
 
   @override
-  bool shouldRepaint(covariant WavePainter oldDelegate) =>
-      oldDelegate.samples != samples;
+  bool shouldRepaint(covariant EcgPainter oldDelegate) =>
+      oldDelegate.samplesMv != samplesMv;
 }
