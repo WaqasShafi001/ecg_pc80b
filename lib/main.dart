@@ -5,14 +5,16 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
+import 'dart:math' as math;
 
 void main() => runApp(const MyApp());
 
-Uuid SERVICE_UUID = Uuid.parse("0000FFF0-0000-1000-8000-00805f9b34fb");
-Uuid CHAR_READ = Uuid.parse("0000FFF1-0000-1000-8000-00805f9b34fb");
-Uuid CHAR_WRITE = Uuid.parse("0000FFF2-0000-1000-8000-00805f9b34fb");
+// BLE UUIDs
+final SERVICE_UUID = Uuid.parse("0000FFF0-0000-1000-8000-00805f9b34fb");
+final CHAR_READ = Uuid.parse("0000FFF1-0000-1000-8000-00805f9b34fb");
+final CHAR_WRITE = Uuid.parse("0000FFF2-0000-1000-8000-00805f9b34fb");
 
-// ----- CRC8-CCITT table from protocol Appendix A -----
+// ----- CRC8-CCITT Implementation -----
 const List<int> _crc8Table = [
   0x00,
   0x5e,
@@ -280,15 +282,10 @@ int crc8Ccitt(List<int> bytes) {
   return crc & 0xFF;
 }
 
-// ----- Helper utilities -----
 Uint8List buildPacket(int token, List<int> data) {
-  final buf = <int>[];
-  buf.add(0xA5);
-  buf.add(token & 0xFF);
-  buf.add(data.length & 0xFF);
+  final buf = <int>[0xA5, token & 0xFF, data.length & 0xFF];
   buf.addAll(data);
-  final c = crc8Ccitt(buf);
-  buf.add(c);
+  buf.add(crc8Ccitt(buf));
   return Uint8List.fromList(buf);
 }
 
@@ -302,6 +299,7 @@ bool validatePacket(List<int> packet) {
 // ----- App -----
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -318,257 +316,237 @@ class MyApp extends StatelessWidget {
 
 class EcgHomePage extends StatefulWidget {
   const EcgHomePage({super.key});
+
   @override
   State<EcgHomePage> createState() => _EcgHomePageState();
 }
 
+enum DeviceState {
+  idle,
+  scanning,
+  connecting,
+  handshaking,
+  ready,
+  measuring,
+  completed,
+  disconnected,
+  error,
+}
+
 class _EcgHomePageState extends State<EcgHomePage> {
   final _ble = FlutterReactiveBle();
-  final _scanController = StreamController<DiscoveredDevice>.broadcast();
-  final List<String> _log = [];
+  final List<String> _loggV = [];
   final List<int> _recvBuffer = [];
+
+  StreamSubscription<DiscoveredDevice>? _scanSub;
   StreamSubscription<ConnectionStateUpdate>? _connSub;
   StreamSubscription<List<int>>? _notifySub;
-  DiscoveredDevice? _selected;
-  String status = 'idle';
+  Timer? _heartbeatTimer;
 
-  // ECG rolling buffer (samples in ADC counts)
-  final ListQueue<double> ecgBuffer = ListQueue(); // store as millivolts
-  final int samplingHz = 150;
-  final double secondsToShow = 5.0;
-  late final int bufferCapacity;
+  DiscoveredDevice? _selectedDevice;
+  DeviceState _state = DeviceState.idle;
 
-  // current metrics
-  int? heartRate;
-  bool leadOff = false;
-  double batteryMv = 0.0;
-  String measureState = 'idle';
+  // ECG data
+  final ListQueue<double> _ecgBuffer = ListQueue();
+  final int _samplingHz = 150;
+  final double _secondsToShow = 5.0;
+  late final int _bufferCapacity;
 
-  // conversion (tweak this to calibrate -> mV)
-  double adcToMv = 0.1; // initial guess: 1 count => 0.1 mV. Adjust as needed.
+  // Metrics
+  int? _heartRate;
+  bool _leadOff = false;
+  double _batteryMv = 0.0;
+  String _measureStage = 'idle';
 
-  // add in state
-  bool measuring = false;
-  final List<double> collectedSamplesAll = []; // full recording (mV)
-  final int smoothingWindow = 3; // moving average window
-  final List<double> _baselineWindow = []; // for baseline removal
-  final int baselineWindowSize = 25; // adjust for baseline estimation
-  int _zeroFrameCount = 0;
+  // ADC calibration (per protocol: 12-bit ADC, adjust for actual mV)
+  // Protocol specifies 5mm/mV display scale. Typical ECG: 1mV = ~200 ADC counts
+  double _adcToMv = 0.005; // 1 ADC count ≈ 0.005 mV (adjust empirically)
+
+  // Full recording
+  final List<double> _collectedSamples = [];
+  int _lastSeqNo = -1;
 
   @override
   void initState() {
     super.initState();
-    bufferCapacity = (samplingHz * secondsToShow).toInt(); // e.g., 750
+    _bufferCapacity = (_samplingHz * _secondsToShow).toInt();
   }
 
   @override
   void dispose() {
-    _scanController.close();
-    _connSub?.cancel();
-    _notifySub?.cancel();
+    _cleanup();
     super.dispose();
   }
 
-  void _appendLog(String text) {
-    final t = "${DateTime.now().toIso8601String()} $text";
-    setState(() {
-      _log.insert(0, t);
-      if (_log.length > 300) _log.removeLast();
-    });
-    // also print JSON / human-readable to console for debug
-    // ignore: avoid_print
-    print(t);
+  void _cleanup() async {
+    _scanSub?.cancel();
+    _connSub?.cancel();
+    _notifySub?.cancel();
+    _heartbeatTimer?.cancel();
+    // Optionally attempt a disconnect if device is selected
+    if (_selectedDevice != null) {
+      try {
+        // _ble.disconnectDevice(id: _selectedDevice!.id);
+        await _ble.deinitialize();
+      } catch (_) {}
+    }
   }
 
-  Future<void> scanForDevices() async {
-    _appendLog('Scan start...');
+  void _logg(String msg) {
+    final timestamp = DateTime.now().toIso8601String().substring(11, 23);
     setState(() {
-      status = 'scanning';
-      _selected = null;
+      _loggV.insert(0, '[$timestamp] $msg');
+      if (_loggV.length > 200) _loggV.removeLast();
     });
-    final seen = <String>{};
+    debugPrint(msg);
+  }
 
-    _ble
+  // ----- Scanning -----
+  Future<void> _startScan() async {
+    _logg('🔍 Starting scan...');
+    setState(() {
+      _state = DeviceState.scanning;
+      _selectedDevice = null;
+    });
+
+    _scanSub?.cancel();
+    _scanSub = _ble
         .scanForDevices(
           withServices: [SERVICE_UUID],
           scanMode: ScanMode.lowLatency,
         )
         .listen(
           (device) {
-            if (seen.contains(device.id)) return;
-            seen.add(device.id);
-            if ((device.name?.isNotEmpty ?? false) ||
-                device.serviceUuids.contains(SERVICE_UUID)) {
-              _appendLog('Found ${device.name} (${device.id})');
-
-              if (_selected == null || _selected!.id != device.id) {
-                setState(() {
-                  _selected = device;
-                });
-              }
-              _scanController.add(device);
+            if (_selectedDevice == null &&
+                (device.name.contains('PC80B') ||
+                    device.serviceUuids.contains(SERVICE_UUID))) {
+              _logg('📱 Found: ${device.name} (${device.id})');
+              setState(() => _selectedDevice = device);
+              _scanSub?.cancel();
             }
           },
           onError: (e) {
-            _appendLog('Scan error: $e');
-            setState(() => status = 'idle');
+            _logg('❌ Scan error: $e');
+            setState(() => _state = DeviceState.error);
           },
         );
   }
 
-  Future<void> connectTo(DiscoveredDevice dev) async {
-    _appendLog('Connecting to ${dev.name}');
-    setState(() {
-      status = 'connecting';
-      _selected = dev;
-    });
+  // ----- Connection -----
+  Future<void> _connect() async {
+    if (_selectedDevice == null) return;
+
+    _logg('🔗 Connecting to ${_selectedDevice!.name}...');
+    setState(() => _state = DeviceState.connecting);
+
     _connSub?.cancel();
     _connSub = _ble
         .connectToDevice(
-          id: dev.id,
-          connectionTimeout: const Duration(seconds: 8),
+          id: _selectedDevice!.id,
+          connectionTimeout: const Duration(seconds: 10),
         )
         .listen(
           (update) {
-            _appendLog('ConnState: ${update.connectionState}');
+            _logg('Connection state: ${update.connectionState}');
+
             if (update.connectionState == DeviceConnectionState.connected) {
-              setState(() => status = 'connected');
-              _subscribeNotifications();
-              // send version query per protocol
-              final q = buildPacket(0x11, [0x00, 0x00, 0x00]);
-              _writeWithResponse(q);
-              // send heartbeat timer optionally
+              _onConnected();
             } else if (update.connectionState ==
                 DeviceConnectionState.disconnected) {
-              _appendLog('Disconnected');
-              _notifySub?.cancel();
-              setState(() {
-                status = 'disconnected';
-                _selected = null;
-              });
+              _onDisconnected();
             }
           },
           onError: (e) {
-            _appendLog('Connection error: $e');
-            setState(() => status = 'idle');
+            _logg('❌ Connection error: $e');
+            setState(() => _state = DeviceState.error);
           },
         );
   }
 
-  void _onMeasurementComplete(Map<String, dynamic> result) {
-    if (!mounted) return;
-    measuring = false;
-    // unsubscribe so we stop receiving noisy packets
-    _notifySub?.cancel();
-    _notifySub = null;
-    // optionally stop device from streaming by sending a host packet if protocol defines one
-    // e.g., send a host "stop" command if you find it in the doc (left commented)
-    // final stopPkt = buildPacket(0x??, [0x00]); _writeWithResponse(stopPkt);
+  void _onConnected() {
+    _logg('✅ Connected!');
+    setState(() => _state = DeviceState.handshaking);
+    _subscribeNotifications();
+    _startHandshake();
+  }
 
+  void _onDisconnected() {
+    _logg('🔌 Disconnected');
+    _cleanup();
     setState(() {
-      status = 'completed';
-      heartRate = result['hr'] as int?;
+      _state = DeviceState.disconnected;
+      _selectedDevice = null;
     });
-
-    // show result dialog
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Measurement Complete'),
-        content: SingleChildScrollView(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('HR: ${result['hr'] ?? '--'} bpm'),
-              const SizedBox(height: 6),
-              Text('Result: ${result['analysisText'] ?? '—'}'),
-              const SizedBox(height: 12),
-              Text('Timestamp: ${result['datetime']}'),
-              const SizedBox(height: 12),
-              Text('Samples saved: ${(result['samples'] as List).length}'),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.of(context).pop();
-              // keep data in memory for later send/print
-            },
-            child: const Text('Close'),
-          ),
-          TextButton(
-            onPressed: () {
-              Navigator.of(context).pop();
-              // _saveResultToFile(result);
-              _appendLog('Result saved $result');
-            },
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
   }
 
-  Future<void> _writeWithResponse(Uint8List bytes) async {
-    if (_selected == null) return;
-    try {
-      await _ble.writeCharacteristicWithResponse(
-        QualifiedCharacteristic(
-          deviceId: _selected!.id,
-          serviceId: SERVICE_UUID,
-          characteristicId: CHAR_WRITE,
-        ),
-        value: bytes,
-      );
-    } catch (e) {
-      _appendLog('Write error: $e');
-    }
-  }
-
+  // ----- Notifications -----
   void _subscribeNotifications() {
-    if (_selected == null) return;
+    if (_selectedDevice == null) return;
+
     _notifySub?.cancel();
     final char = QualifiedCharacteristic(
-      deviceId: _selected!.id,
+      deviceId: _selectedDevice!.id,
       serviceId: SERVICE_UUID,
       characteristicId: CHAR_READ,
     );
+
     _notifySub = _ble.subscribeToCharacteristic(char).listen((data) {
-      _appendLog('raw ${data.length} bytes');
-      _feedBytes(data);
-    }, onError: (e) => _appendLog('Notify error: $e'));
+      _recvBuffer.addAll(data);
+      _parsePackets();
+    }, onError: (e) => _logg('❌ Notify error: $e'));
   }
 
-  // feed bytes into buffer and try to parse packets
-  void _feedBytes(List<int> bytes) {
-    _recvBuffer.addAll(bytes);
-    _tryParseBuffer();
+  // ----- Handshake Flow -----
+  Future<void> _startHandshake() async {
+    // Step 1: Send version query (0x11)
+    await Future.delayed(const Duration(milliseconds: 200));
+    await _write(buildPacket(0x11, [0x00, 0x00, 0x00]));
+    _logg('📤 Sent version query (0x11)');
+
+    // Step 2: Start heartbeat (per protocol: 1 packet/second)
+    _startHeartbeat();
   }
 
-  void _tryParseBuffer() {
+  void _startHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (_state != DeviceState.disconnected && _state != DeviceState.idle) {
+        _write(buildPacket(0xFF, [0x00]));
+      }
+    });
+  }
+
+  // ----- Packet Parsing -----
+  void _parsePackets() {
     while (true) {
       if (_recvBuffer.length < 4) return;
-      final headIndex = _recvBuffer.indexOf(0xA5);
-      if (headIndex == -1) {
+
+      final headIdx = _recvBuffer.indexOf(0xA5);
+      if (headIdx == -1) {
         _recvBuffer.clear();
         return;
       }
-      if (headIndex > 0) {
-        _recvBuffer.removeRange(0, headIndex);
-        if (_recvBuffer.length < 4) return;
+
+      if (headIdx > 0) {
+        _recvBuffer.removeRange(0, headIdx);
       }
+
       if (_recvBuffer.length < 4) return;
+
       final token = _recvBuffer[1];
       final len = _recvBuffer[2];
       final total = 3 + len + 1;
-      if (_recvBuffer.length < total) return; // wait
+
+      if (_recvBuffer.length < total) return;
+
       final packet = _recvBuffer.sublist(0, total);
       _recvBuffer.removeRange(0, total);
+
       if (!validatePacket(packet)) {
-        _appendLog('CRC fail token 0x${token.toRadixString(16)} dropping');
+        _logg('❌ CRC fail for token 0x${token.toRadixString(16)}');
         continue;
       }
+
       _handlePacket(Uint8List.fromList(packet));
     }
   }
@@ -577,6 +555,7 @@ class _EcgHomePageState extends State<EcgHomePage> {
     final token = packet[1];
     final len = packet[2];
     final data = packet.sublist(3, 3 + len);
+
     switch (token) {
       case 0xFF:
         _handleHeartbeat(data);
@@ -584,323 +563,228 @@ class _EcgHomePageState extends State<EcgHomePage> {
       case 0x11:
         _handleVersionReply(data);
         break;
-      case 0x55:
-        _handleConfig(data); // either request from device or ack response
+      case 0x33:
+        _handleHandshake33(data);
         break;
-      case 0xDD:
-        _handleTracking(data);
+      case 0x55:
+        _handleConfig(data);
         break;
       case 0xAA:
         _handleDataFrame(data);
         break;
-      case 0x33:
-        _handleHandshake33(data);
+      case 0xDD:
+        _handleTracking(data);
         break;
-
       default:
-        _appendLog('Unknown token 0x${token.toRadixString(16)} len $len');
+        _logg('Unknown token: 0x${token.toRadixString(16)}');
     }
   }
 
-  void _handleHandshake33(List<int> data) async {
-    // 0x33: Device handshake packet per protocol
-    _appendLog('Handshake (0x33) from device, ${data.length} bytes');
-    // Usually the device expects host ACK: token 0x33, payload [0x00]
-    // Some docs specify host should echo the same token with 0x00
-    final ack = buildPacket(0x33, [0x00]);
-    await _writeWithResponse(ack);
-    _appendLog('Sent handshake ACK (0x33).');
-
-    // After handshake, you can query version to continue the init flow
-    final qVer = buildPacket(0x11, [0x00, 0x00, 0x00]);
-    await _writeWithResponse(qVer);
-    _appendLog('Sent version query (0x11).');
-  }
-
+  // ----- Packet Handlers -----
   void _handleHeartbeat(List<int> data) {
-    // data[0] incidental info: battery level in low nibble
+    // Device responded to heartbeat - connection alive
     if (data.isNotEmpty) {
-      final info = data[0];
-      final batLevel = info & 0x0F;
-      // map 0..3 to levels — not exact voltage. We'll show level
-      setState(() {
-        batteryMv =
-            0.0; // unknown exact mV from this byte; real battery mV comes in data frames
-      });
-      _appendLog('Heartbeat: level $batLevel');
-    } else {
-      _appendLog('Heartbeat (no incidental info)');
+      final batLevel = data[0] & 0x0F;
+      _logg('💓 Heartbeat OK (battery level: $batLevel)');
     }
   }
 
   void _handleVersionReply(List<int> data) {
-    // device responds with version bytes (BCD etc.)
-    _appendLog(
-      'Version reply: ${data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}',
+    _logg(
+      '📋 Version: ${data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}',
     );
+
+    // After version, move to ready state
+    setState(() => _state = DeviceState.ready);
+    _logg('✅ Device ready!');
   }
 
-  void _handleConfig(List<int> data) {
-    // config packet: DeviceModel(1), Filter+Type(1), DeviceID(12)
+  Future<void> _handleHandshake33(List<int> data) async {
+    _logg('🤝 Handshake (0x33) from device');
+
+    // Respond with ACK
+    await _write(buildPacket(0x33, [0x00]));
+    _logg('📤 Sent handshake ACK (0x33)');
+  }
+
+  Future<void> _handleConfig(List<int> data) async {
     if (data.length >= 14) {
       final model = data[0];
       final filterType = data[1];
-      final deviceId = data.sublist(2, 14);
-      final json = {
-        'token': '0x55',
-        'deviceModel': model,
-        'filterType': filterType,
-        'deviceId': deviceId
-            .map((b) => b.toRadixString(16).padLeft(2, '0'))
-            .join(),
-      };
-      _appendLog('Config: ${jsonEncode(json)}');
-      // send ACK to device to confirm config received
-      final ack = buildPacket(0x55, [0x00]); // ACK=0x00
-      _writeWithResponse(ack);
-    } else if (data.length == 1) {
-      // Host response when host responds to device config
-      final code = data[0];
-      _appendLog('Config response from host code=$code');
+      _logg(
+        '⚙️ Config: model=0x${model.toRadixString(16)}, filter=0x${filterType.toRadixString(16)}',
+      );
+
+      // Send ACK
+      await _write(buildPacket(0x55, [0x00]));
+      _logg('📤 Sent config ACK (0x55)');
     }
   }
 
-  void _handleTracking(Uint8List data) {
-    // SegNo(1), Info(2 little endian), MeasurementStatus(1), ECGdesc(2), ECG data...
-    if (data.length < 6) {
-      _appendLog('Tracking too short ${data.length}');
-      return;
-    }
+  void _handleTracking(List<int> data) {
+    if (data.length < 6) return;
+
     final segNo = data[0];
-    final info = (data[2] << 8) | data[1];
     final measStatus = data[3];
     final ecgDesc = (data[5] << 8) | data[4];
-    measureState = _decodeMeasureStatus(measStatus);
-    // ecgDesc bits: bit15 lead off, bits10-8 data structure
-    final leadOffFlag = ((ecgDesc & 0x8000) != 0);
-    final dataStruct = (ecgDesc >> 8) & 0x07; // bits10-8
-    leadOff = leadOffFlag;
-    // Ecg data follows
-    final ecgBytes = data.sublist(6);
-    if (dataStruct == 1 && ecgBytes.length >= 50) {
-      // 25 samples (2 bytes each)
-      final samples = <double>[];
-      for (int i = 0; i + 1 < ecgBytes.length && samples.length < 25; i += 2) {
-        int v = (ecgBytes[i + 1] << 8) | ecgBytes[i];
-        v &= 0x0FFF; // lower 12 bits valid
-        final mv = v * adcToMv;
-        samples.add(mv);
+
+    _measureStage = _decodeMeasureStatus(measStatus);
+    _leadOff = (ecgDesc & 0x8000) != 0;
+    final dataStruct = (ecgDesc >> 8) & 0x07;
+
+    if (dataStruct == 1 && data.length >= 56) {
+      // 25 samples (structure-1)
+      final ecgBytes = data.sublist(6);
+      for (int i = 0; i + 1 < ecgBytes.length && i < 50; i += 2) {
+        int val = (ecgBytes[i + 1] << 8) | ecgBytes[i];
+        val &= 0x0FFF;
+        final mv = val * _adcToMv;
         _pushSample(mv);
       }
-      _appendLog(
-        'Tracking seg:$segNo struct1 samples:${samples.length} state:$measureState',
-      );
-      // print JSON
-      final json = {
-        'token': '0xDD',
-        'seg': segNo,
-        'state': measureState,
-        'samples': samples,
-      };
-      // ignore: avoid_print
-      print(jsonEncode(json));
-    } else if (dataStruct == 2 && ecgBytes.length >= 9) {
-      // analysis result: year month day hour minute second HR result
-      final year = ((ecgBytes[0] << 8) | ecgBytes[1]);
-      final month = ecgBytes[2];
-      final day = ecgBytes[3];
-      final hour = ecgBytes[4];
-      final minute = ecgBytes[5];
-      final second = ecgBytes[6];
-      final hr = ecgBytes[7];
-      final resultCode = ecgBytes[8];
-      heartRate = hr;
-      final analysisText = _analysisText(resultCode);
+      _logg('📊 Tracking seg:$segNo stage:$_measureStage samples:25');
+    } else if (dataStruct == 2 && data.length >= 15) {
+      // Analysis result (structure-2)
+      final year = (data[7] << 8) | data[6];
+      final hr = data[13];
+      final resultCode = data[14];
 
-      _appendLog(
-        'Analysis: $year-$month-$day $hour:$minute:$second HR:$hr result:$resultCode ${_analysisText(resultCode)}',
-      );
-      // Build result object
-      final result = {
-        'datetime': '$year-$month-$day $hour:$minute:$second',
-        'hr': hr,
-        'resultCode': resultCode,
-        'analysisText': analysisText,
-        'deviceId': _selected?.id ?? '',
-        'samples': collectedSamplesAll, // full recording (centered)
-      };
+      _heartRate = hr;
+      final analysisText = _getAnalysisText(resultCode);
 
-      _onMeasurementComplete(result);
-
-      final json = {
-        'token': '0xDD',
-        'analysis': {
-          'datetime': '$year-$month-$day $hour:$minute:$second',
-          'hr': hr,
-          'result': resultCode,
-        },
-      };
-      // ignore: avoid_print
-      print(jsonEncode(json));
-    } else {
-      _appendLog('Tracking struct:$dataStruct bytes:${ecgBytes.length}');
+      _logg('📈 Analysis: HR=$hr, result=$resultCode ($analysisText)');
+      _onMeasurementComplete(hr, resultCode, analysisText);
     }
+
     setState(() {});
   }
 
-  void _handleDataFrame(Uint8List data) {
-    // Data frame: seq(1) followed by payload
+  void _handleDataFrame(List<int> data) {
     if (data.isEmpty) return;
+
     final seq = data[0];
     final payload = data.sublist(1);
-    // For real-time upload (protocol 4.2.2), the device sends 25 points (25*2 bytes) + HR(1) + lead&battery(2) total length 25*2+3 = 53
-    if (payload.length >= (25 * 2 + 3)) {
-      final samples = <double>[];
+
+    // Real-time data (structure per protocol 4.2.2)
+    if (payload.length >= 53) {
+      // 25 samples (50 bytes) + HR (1) + leadBattery (2)
       for (int i = 0; i < 25; i++) {
         final lo = payload[i * 2];
         final hi = payload[i * 2 + 1];
         int val = (hi << 8) | lo;
         val &= 0x0FFF;
-        final mv = val * adcToMv;
-        samples.add(mv);
+        final mv = val * _adcToMv;
         _pushSample(mv);
       }
-      // trailing bytes
-      final hr = payload[25 * 2];
-      final leadBatteryLow = payload[25 * 2 + 1];
-      final leadBatteryHigh = payload[25 * 2 + 2];
-      final leadBattery =
-          (leadBatteryHigh << 8) |
-          leadBatteryLow; // little endian note in doc: high after low
-      final leadFlag = ((leadBattery & 0x8000) != 0);
-      final batteryVal =
-          (leadBattery &
-          0x0FFF); // bits 11..0 represent battery (unit: mV per doc)
-      // Build readable metrics
-      heartRate = hr;
-      leadOff = leadFlag;
-      // batteryVal unit per doc is mV (they said unit MV but it is mV likely). We'll treat as mV.
-      batteryMv = batteryVal.toDouble();
-      // ACK back to device for real-time packet (Host should respond with ACK)
-      final ackPacket = buildPacket(0xAA, [seq, 0x00]); // seq + ACK(0x00)
-      _writeWithResponse(ackPacket);
-      final json = {
-        'token': '0xAA',
-        'seq': seq,
-        'hr': hr,
-        'leadOff': leadOff,
-        'battery_mV': batteryMv,
-        'samples_mV': samples,
-      };
-      _appendLog(
-        'Realtime seq:$seq HR:$hr battery:${batteryMv.toStringAsFixed(0)}mV lead:${leadOff ? "OFF" : "ON"}',
-      );
-      // large sample JSON to console
-      // ignore: avoid_print
-      print(jsonEncode(json));
+
+      final hr = payload[50];
+      final leadBatLo = payload[51];
+      final leadBatHi = payload[52];
+      final leadBat = (leadBatHi << 8) | leadBatLo;
+
+      _heartRate = hr;
+      _leadOff = (leadBat & 0x8000) != 0;
+      _batteryMv = (leadBat & 0x0FFF).toDouble();
+
+      // Send ACK
+      _write(buildPacket(0xAA, [seq, 0x00]));
+
+      if (_lastSeqNo != seq) {
+        _logg('📡 Real-time seq:$seq HR:$hr battery:${_batteryMv.toInt()}mV');
+        _lastSeqNo = seq;
+      }
+
       setState(() {});
-      // after parsing samples
-      // detect end-of-measurement heuristic: many frames with all zero samples or hr==0
-      if (hr == 0) {
-        // increment a counter (add a state field _zeroFrameCount)
-        _zeroFrameCount = (_zeroFrameCount ?? 0) + 1;
-      } else {
-        _zeroFrameCount = 0;
-      }
-      if ((_zeroFrameCount ?? 0) >= 4) {
-        // 4 consecutive empty frames => end
-        final result = {
-          'datetime': DateTime.now().toIso8601String(),
-          'hr': heartRate ?? 0,
-          'resultCode': -1,
-          'analysisText': 'End detected (no analysis packet).',
-          'deviceId': _selected?.id ?? '',
-          'samples': collectedSamplesAll,
-        };
-        _onMeasurementComplete(result);
-        return;
-      }
-    } else {
-      // Possibly non-real-time data chunk (SCP) — we base64 it and log
-      final json = {
-        'token': '0xAA',
-        'seq': seq,
-        'payloadBase64': base64Encode(payload),
-      };
-      _appendLog('Data chunk seq:$seq size:${payload.length}');
-      // ignore: avoid_print
-      print(jsonEncode(json));
     }
   }
 
+  // ----- Sample Management -----
   void _pushSample(double mv) {
-    // ignore obviously invalid values (zeros or tiny noise) - device sometimes sends spurious zeros
-    if (mv <= 0.5) {
-      // small value — treat as gap; skip pushing but keep continuity
-      return;
-    }
-    // clamp outliers (prevent single-sample spikes)
-    if (_baselineWindow.isNotEmpty) {
-      final baseline =
-          _baselineWindow.reduce((a, b) => a + b) / _baselineWindow.length;
-      if ((mv - baseline).abs() > 200.0) {
-        // 200 mV jump is suspicious, tune as needed
-        // ignore outlier
-        return;
-      }
-    }
+    // Guard - skip obviously invalid noise
+    if (mv.isNaN || mv.isInfinite) return;
 
-    // maintain baseline window (moving mean)
-    _baselineWindow.add(mv);
-    if (_baselineWindow.length > baselineWindowSize)
-      _baselineWindow.removeAt(0);
-    final baseline =
-        _baselineWindow.reduce((a, b) => a + b) / _baselineWindow.length;
+    // small threshold to remove tiny noise
+    if (mv.abs() < 0.02) return;
 
-    // remove baseline (center waveform)
-    final centered = mv - baseline;
+    _collectedSamples.add(mv);
 
-    // smoothing (simple moving average)
-    // we'll keep a short buffer in collectedSamplesAll for smoothing
-    collectedSamplesAll.add(centered);
-    if (collectedSamplesAll.length >= smoothingWindow) {
-      // compute average of last N values to smooth
-      final start = collectedSamplesAll.length - smoothingWindow;
-      final window = collectedSamplesAll.sublist(start);
-      final avg = window.reduce((a, b) => a + b) / window.length;
-      // push into visible ecgBuffer as mV (you may want to scale)
-      if (ecgBuffer.length >= bufferCapacity) ecgBuffer.removeFirst();
-      ecgBuffer.add(avg);
-    } else {
-      // warm-up: push raw centered
-      if (ecgBuffer.length >= bufferCapacity) ecgBuffer.removeFirst();
-      ecgBuffer.add(centered);
+    // Add to display buffer
+    if (_ecgBuffer.length >= _bufferCapacity) {
+      _ecgBuffer.removeFirst();
     }
+    _ecgBuffer.add(mv);
   }
 
+  // ----- Measurement Control -----
+  Future<void> _startMeasurement() async {
+    _logg('▶️ Starting measurement...');
+
+    setState(() {
+      _state = DeviceState.measuring;
+      _ecgBuffer.clear();
+      _collectedSamples.clear();
+      _heartRate = null;
+      _measureStage = 'preparing';
+    });
+
+    // Request real-time transmission (per protocol section 4.2.1)
+    final deviceId = List<int>.filled(12, 0x00);
+    final payload = [0x80, 0x00, ...deviceId]; // Model 0x80, Type 0x00
+    await _write(buildPacket(0x55, payload));
+    _logg('📤 Requested real-time mode (0x55)');
+  }
+
+  void _onMeasurementComplete(int? hr, int resultCode, String analysisText) {
+    setState(() {
+      _state = DeviceState.completed;
+      _heartRate = hr;
+    });
+
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('📊 Measurement Complete'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Heart Rate: ${hr ?? '--'} bpm',
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 12),
+            Text('Result: $analysisText'),
+            const SizedBox(height: 12),
+            Text('Samples: ${_collectedSamples.length}'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              setState(() => _state = DeviceState.ready);
+            },
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ----- Helper Methods -----
   String _decodeMeasureStatus(int b) {
-    // bit7..6 channel, bit5..4 measure mode, bit3..0 stage
     final stage = b & 0x0F;
-    switch (stage) {
-      case 0:
-        return 'detecting';
-      case 1:
-        return 'preparing';
-      case 2:
-        return 'measuring';
-      case 3:
-        return 'analysing';
-      case 4:
-        return 'reporting';
-      case 5:
-        return 'tracking_end';
-      default:
-        return 'stage_$stage';
-    }
+    const stages = [
+      'detecting',
+      'preparing',
+      'measuring',
+      'analysing',
+      'reporting',
+      'tracking_end',
+    ];
+    return stage < stages.length ? stages[stage] : 'stage_$stage';
   }
 
-  String _analysisText(int code) {
-    // Appendix B mapping
+  String _getAnalysisText(int code) {
     const mapping = {
       0: 'No irregular rhythm found',
       1: 'Suspected a little fast beat',
@@ -923,196 +807,350 @@ class _EcgHomePageState extends State<EcgHomePage> {
     return mapping[code] ?? 'Result $code';
   }
 
-  // UI actions
-  void requestRealTime() {
-    // Send config: Device Model 0x80, TransmissionType 0x00, Device ID 12 zeros (or you can read deviceId earlier)
-    final deviceId = List<int>.filled(12, 0x00);
-    final payload = <int>[0x80, 0x00] + deviceId;
-    final packet = buildPacket(0x55, payload);
-    _writeWithResponse(packet);
-    _appendLog('Requested real-time (0x55) sent.');
+  Future<void> _write(Uint8List bytes) async {
+    if (_selectedDevice == null) return;
+    try {
+      await _ble.writeCharacteristicWithResponse(
+        QualifiedCharacteristic(
+          deviceId: _selectedDevice!.id,
+          serviceId: SERVICE_UUID,
+          characteristicId: CHAR_WRITE,
+        ),
+        value: bytes,
+      );
+    } catch (e) {
+      _logg('❌ Write error: $e');
+    }
   }
 
-  // Build UI
+  Future<void> _disconnect() async {
+    if (_selectedDevice == null) return;
+    _logg('🔌 Disconnecting...');
+    try {
+      // cancel streams & ask BLE to disconnect
+      _scanSub?.cancel();
+      _notifySub?.cancel();
+      _connSub?.cancel();
+      // await _ble.disconnectDevice(id: _selectedDevice!.id);
+      await _ble.deinitialize();
+    } catch (e) {
+      _logg('❌ Disconnect error: $e');
+    } finally {
+      _cleanup();
+      setState(() {
+        _state = DeviceState.disconnected;
+        _selectedDevice = null;
+      });
+    }
+  }
+
+  // ----- UI -----
   @override
   Widget build(BuildContext context) {
-    final samples = ecgBuffer.toList();
     return Scaffold(
-      appBar: AppBar(title: const Text('PC-80B - Live ECG')),
+      appBar: AppBar(
+        title: const Text('PC-80B ECG Monitor'),
+        backgroundColor: Colors.black87,
+      ),
       body: SafeArea(
         child: Column(
           children: [
-            // top controls & metrics
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              child: Row(
-                children: [
-                  ElevatedButton.icon(
+            _buildControlPanel(),
+            _buildWaveformCard(),
+            _buildMetricsCard(),
+            _buildLogPanel(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildControlPanel() {
+    return Card(
+      margin: const EdgeInsets.all(8),
+      color: Colors.black87,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
                     icon: const Icon(Icons.search),
                     label: const Text('Scan'),
-                    onPressed: scanForDevices,
+                    onPressed: _state == DeviceState.idle ? _startScan : null,
                   ),
-                  const SizedBox(width: 8),
-                  ElevatedButton.icon(
-                    icon: const Icon(Icons.bluetooth_connected),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    icon: const Icon(Icons.bluetooth),
                     label: const Text('Connect'),
-                    onPressed: _selected == null
-                        ? null
-                        : () => connectTo(_selected!),
+                    onPressed:
+                        _selectedDevice != null &&
+                            (_state == DeviceState.scanning ||
+                                _state == DeviceState.disconnected)
+                        ? _connect
+                        : null,
                   ),
-                  const SizedBox(width: 8),
-                  ElevatedButton.icon(
-                    icon: const Icon(Icons.stream),
-                    label: const Text('Request Real-Time'),
-                    onPressed: _selected == null ? null : requestRealTime,
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Status: $status',
-                          style: const TextStyle(fontSize: 12),
-                        ),
-                        Text(
-                          'Measure: $measureState',
-                          style: const TextStyle(fontSize: 12),
-                        ),
-                      ],
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    icon: const Icon(Icons.play_arrow),
+                    label: const Text('Measure'),
+                    onPressed: _state == DeviceState.ready
+                        ? _startMeasurement
+                        : null,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.green.shade700,
                     ),
                   ),
-                  Column(
-                    crossAxisAlignment: CrossAxisAlignment.end,
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                _buildStatusChip(_state.name, _getStateColor(_state)),
+                const SizedBox(width: 8),
+                if (_selectedDevice != null)
+                  Expanded(
+                    child: Text(
+                      _selectedDevice!.name,
+                      style: const TextStyle(fontSize: 12),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                const SizedBox(width: 8),
+                if (_selectedDevice != null)
+                  IconButton(
+                    tooltip: 'Disconnect',
+                    onPressed: _disconnect,
+                    icon: const Icon(Icons.cancel, color: Colors.redAccent),
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStatusChip(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.2),
+        border: Border.all(color: color),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Text(
+        label.toUpperCase(),
+        style: TextStyle(
+          color: color,
+          fontSize: 11,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
+    );
+  }
+
+  Color _getStateColor(DeviceState state) {
+    switch (state) {
+      case DeviceState.ready:
+      case DeviceState.completed:
+        return Colors.green;
+      case DeviceState.measuring:
+        return Colors.blue;
+      case DeviceState.error:
+      case DeviceState.disconnected:
+        return Colors.red;
+      default:
+        return Colors.orange;
+    }
+  }
+
+  Widget _buildWaveformCard() {
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 8),
+      color: Colors.black,
+      child: Container(
+        height: 240,
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'ECG Waveform ${_leadOff ? "⚠️ LEAD OFF" : ""}',
+              style: TextStyle(
+                color: _leadOff ? Colors.red : Colors.white70,
+                fontSize: 12,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Expanded(
+              child: CustomPaint(
+                painter: EcgPainter(_ecgBuffer.toList()),
+                child: Container(),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMetricsCard() {
+    return Card(
+      margin: const EdgeInsets.all(8),
+      color: Colors.black87,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                _buildMetric('HR', '${_heartRate ?? '--'} bpm', Colors.red),
+                _buildMetric(
+                  'Battery',
+                  '${_batteryMv.toInt()} mV',
+                  Colors.blue,
+                ),
+                _buildMetric('Stage', _measureStage, Colors.orange),
+              ],
+            ),
+            const SizedBox(height: 8),
+            // ADC scale control
+            Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        'HR: ${heartRate ?? "--"} bpm',
-                        style: const TextStyle(
-                          fontSize: 18,
-                          color: Colors.greenAccent,
-                        ),
+                      const Text(
+                        'ADC Scale (µV / count)',
+                        style: TextStyle(fontSize: 12),
                       ),
-                      Text(
-                        'Battery: ${batteryMv > 0 ? "${batteryMv.toStringAsFixed(0)} mV" : "--"}',
-                        style: const TextStyle(fontSize: 12),
-                      ),
-                      Text(
-                        leadOff ? "Touch electrodes to start" : "Signal OK",
-                        style: TextStyle(
-                          color: leadOff
-                              ? Colors.redAccent
-                              : Colors.greenAccent,
-                        ),
+                      const SizedBox(height: 6),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Slider(
+                              min: 1.0, // 1 µV
+                              max: 20.0, // 20 µV
+                              divisions: 19,
+                              value: (_adcToMv * 1000).clamp(1.0, 20.0),
+                              label:
+                                  '${(_adcToMv * 1000).toStringAsFixed(1)} µV',
+                              onChanged: (v) {
+                                setState(() {
+                                  _adcToMv = v / 1000.0;
+                                });
+                              },
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              const Text(
+                                'Current',
+                                style: TextStyle(fontSize: 10),
+                              ),
+                              Text(
+                                '${(_adcToMv * 1000).toStringAsFixed(1)} µV',
+                                style: const TextStyle(
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
                       ),
                     ],
                   ),
-                ],
-              ),
-            ),
-
-            // waveform
-            Card(
-              margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              color: const Color(0xFF081010),
-              child: SizedBox(
-                height: 220,
-                child: Padding(
-                  padding: const EdgeInsets.all(8.0),
-                  child: CustomPaint(
-                    painter: EcgPainter(samples),
-                    child: Container(),
-                  ),
                 ),
-              ),
+              ],
             ),
+          ],
+        ),
+      ),
+    );
+  }
 
-            // controls: scale adjust
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12.0),
+  Widget _buildMetric(String title, String value, Color color) {
+    return Column(
+      children: [
+        Text(title, style: const TextStyle(fontSize: 12)),
+        const SizedBox(height: 6),
+        Text(
+          value,
+          style: TextStyle(
+            fontSize: 18,
+            fontWeight: FontWeight.bold,
+            color: color,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLogPanel() {
+    return Expanded(
+      child: Card(
+        margin: const EdgeInsets.all(8),
+        color: Colors.black,
+        child: Column(
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+              color: Colors.black87,
               child: Row(
                 children: [
-                  const Text('ADC→mV scale:'),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Slider(
-                      value: adcToMv,
-                      min: 0.01,
-                      max: 1.0,
-                      divisions: 99,
-                      label: adcToMv.toStringAsFixed(2),
-                      onChanged: (v) => setState(() => adcToMv = v),
-                    ),
+                  const Text(
+                    'Logs',
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
                   ),
-                  Text(adcToMv.toStringAsFixed(2)),
+                  const Spacer(),
+                  IconButton(
+                    tooltip: 'Clear logs',
+                    onPressed: () {
+                      setState(() => _loggV.clear());
+                    },
+                    icon: const Icon(Icons.delete, color: Colors.redAccent),
+                  ),
                 ],
               ),
             ),
-
-            const Divider(),
-            if (status == 'completed')
-              Card(
-                margin: const EdgeInsets.all(12),
-                child: ListTile(
-                  leading: const Icon(Icons.check_circle, color: Colors.green),
-                  title: Text('HR: ${heartRate ?? "--"} bpm'),
-                  subtitle: Text(
-                    'Measurement complete. Tap Save to store result.',
-                  ),
-                  trailing: IconButton(
-                    icon: const Icon(Icons.save),
-                    onPressed: () {
-                      final res = {
-                        'hr': heartRate,
-                        'analysisText': measureState,
-                        'samples': collectedSamplesAll,
-                        'datetime': DateTime.now().toIso8601String(),
-                      };
-                      // _saveResultToFile(res);
-                      _appendLog('Result saved $res');
-                    },
-                  ),
-                ),
-              ),
-
-            // logs
             Expanded(
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: Column(
-                  children: [
-                    const Align(
-                      alignment: Alignment.centerLeft,
+              child: _loggV.isEmpty
+                  ? const Center(
                       child: Text(
-                        'Log (latest):',
-                        style: TextStyle(fontWeight: FontWeight.bold),
+                        'No logs yet',
+                        style: TextStyle(color: Colors.white54),
                       ),
-                    ),
-                    const SizedBox(height: 6),
-                    Expanded(
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: Colors.black,
-                          borderRadius: BorderRadius.circular(6),
-                        ),
-                        child: ListView.builder(
-                          reverse: true,
-                          itemCount: _log.length,
-                          itemBuilder: (c, i) => Padding(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 8,
-                              vertical: 4,
-                            ),
-                            child: Text(
-                              _log[i],
-                              style: const TextStyle(fontSize: 11),
-                            ),
+                    )
+                  : ListView.builder(
+                      reverse: false,
+                      itemCount: _loggV.length,
+                      itemBuilder: (context, idx) {
+                        final line = _loggV[idx];
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8.0,
+                            vertical: 6,
                           ),
-                        ),
-                      ),
+                          child: Text(
+                            line,
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                        );
+                      },
                     ),
-                  ],
-                ),
-              ),
             ),
           ],
         ),
@@ -1121,53 +1159,113 @@ class _EcgHomePageState extends State<EcgHomePage> {
   }
 }
 
-// Painter: draws waveform in green, smooth polyline
+// ----- ECG Painter -----
 class EcgPainter extends CustomPainter {
-  final List<double> samplesMv;
-  EcgPainter(this.samplesMv);
+  final List<double> samples;
+  EcgPainter(this.samples);
+
   @override
   void paint(Canvas canvas, Size size) {
-    final bg = Paint()..color = const Color(0xFF061010);
-    canvas.drawRect(Offset.zero & size, bg);
+    // background
+    final bgPaint = Paint()..color = const Color(0xFF050507);
+    canvas.drawRect(Offset.zero & size, bgPaint);
 
-    if (samplesMv.isEmpty) return;
-
-    final paint = Paint()
-      ..color = Colors.greenAccent
-      ..strokeWidth = 1.4
-      ..style = PaintingStyle.stroke
-      ..isAntiAlias = true;
-
-    // scale samples to fit vertical space
-    final maxVal = samplesMv.reduce((a, b) => a > b ? a : b);
-    final minVal = samplesMv.reduce((a, b) => a < b ? a : b);
-    final range = (maxVal - minVal) == 0 ? 1.0 : (maxVal - minVal);
-    final n = samplesMv.length;
-    final stepX = size.width / (n - 1).clamp(1, double.infinity);
-    final path = Path();
-    for (int i = 0; i < n; i++) {
-      final x = i * stepX;
-      final normalized = (samplesMv[i] - minVal) / range;
-      final y = size.height - normalized * size.height;
-      if (i == 0)
-        path.moveTo(x, y);
-      else
-        path.lineTo(x, y);
-    }
-    canvas.drawPath(path, paint);
-
-    // draw midline
-    final midPaint = Paint()
-      ..color = Colors.white24
+    // grid
+    final gridPaint = Paint()
+      ..color = Colors.grey.withOpacity(0.12)
       ..strokeWidth = 0.5;
+
+    const double mmPerCell = 10; // visually, not real mm -> adjust
+    for (double x = 0; x <= size.width; x += mmPerCell) {
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), gridPaint);
+    }
+    for (double y = 0; y <= size.height; y += mmPerCell) {
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), gridPaint);
+    }
+
+    // thicker central horizontal baseline
+    final baselinePaint = Paint()
+      ..color = Colors.white24
+      ..strokeWidth = 1.0;
     canvas.drawLine(
       Offset(0, size.height / 2),
       Offset(size.width, size.height / 2),
-      midPaint,
+      baselinePaint,
     );
+
+    if (samples.isEmpty) return;
+
+    // compute vertical scale: fit most of waveform to view
+    double minMv = samples.reduce(math.min);
+    double maxMv = samples.reduce(math.max);
+
+    // enforce a sensible range to avoid flat-line zooms
+    double range = (maxMv - minMv);
+    if (range < 0.5) {
+      // if data small, center around 0 and use ±1.5 mV
+      minMv = -1.5;
+      maxMv = 1.5;
+      range = 3.0;
+    } else {
+      // add margin
+      final margin = range * 0.2;
+      minMv -= margin;
+      maxMv += margin;
+      range = maxMv - minMv;
+    }
+
+    // horizontal scaling: display up to width with current number of samples
+    final sampleCount = samples.length;
+    final dx = sampleCount > 1 ? size.width / (sampleCount - 1) : size.width;
+
+    // path
+    final path = Path();
+    for (int i = 0; i < samples.length; i++) {
+      final x = i * dx;
+      // map mv to y (invert because canvas y grows downward)
+      final norm = (samples[i] - minMv) / range;
+      final y = size.height - (norm * size.height);
+      if (i == 0) {
+        path.moveTo(x, y);
+      } else {
+        // smooth using quadratic Bezier
+        final prevX = (i - 1) * dx;
+        final prevY =
+            size.height - ((samples[i - 1] - minMv) / range * size.height);
+        final cpx = (prevX + x) / 2;
+        final cpy = (prevY + y) / 2;
+        path.quadraticBezierTo(prevX, prevY, cpx, cpy);
+      }
+    }
+
+    final linePaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0
+      ..strokeCap = StrokeCap.round
+      ..shader = null
+      ..color = Colors.greenAccent;
+
+    canvas.drawPath(path, linePaint);
+
+    // optional: draw latest value marker
+    final lastX = (samples.length - 1) * dx;
+    final lastY = size.height - ((samples.last - minMv) / range * size.height);
+    final dotPaint = Paint()..color = Colors.white;
+    canvas.drawCircle(Offset(lastX, lastY), 3.0, dotPaint);
   }
 
   @override
-  bool shouldRepaint(covariant EcgPainter oldDelegate) =>
-      oldDelegate.samplesMv != samplesMv;
+  bool shouldRepaint(covariant EcgPainter oldDelegate) {
+    return !listEquals(oldDelegate.samples, samples);
+  }
+}
+
+// Helper: deep listEquals (for shouldRepaint)
+bool listEquals(List<double>? a, List<double>? b) {
+  if (a == null || b == null) return a == b;
+  if (a.length != b.length) return false;
+  for (int i = 0; i < a.length; i++) {
+    if ((a[i] - b[i]).abs() > 1e-9) return false;
+  }
+  return true;
 }
