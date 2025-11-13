@@ -7,10 +7,12 @@ import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
 import 'dart:math' as math;
 
 void main() => runApp(const MyApp());
+
 // BLE UUIDs
 final SERVICE_UUID = Uuid.parse("0000FFF0-0000-1000-8000-00805f9b34fb");
 final CHAR_READ = Uuid.parse("0000FFF1-0000-1000-8000-00805f9b34fb");
 final CHAR_WRITE = Uuid.parse("0000FFF2-0000-1000-8000-00805f9b34fb");
+
 // ----- CRC8-CCITT Implementation -----
 const List<int> _crc8Table = [
   0x00,
@@ -270,6 +272,7 @@ const List<int> _crc8Table = [
   0x6b,
   0x35,
 ];
+
 int crc8Ccitt(List<int> bytes) {
   int crc = 0x00;
   for (final b in bytes) {
@@ -594,26 +597,36 @@ class _EcgHomePageState extends State<EcgHomePage> {
     if (data.length < 6) return;
     final segNo = data[0];
     final measStatus = data[3];
-    final info = (data[5] << 8) | data[4];
+
+    // Note: Per protocol doc, amplitude is in bytes 1 & 2 (Information field)
+    // However, device seems to send it in bytes 4 & 5 (ECG data description)
+    // in the 'reserved' bits 14-12, just like 0xAA packet.
+    // We will parse from bytes 4 & 5, as the code originally did.
+    final info = (data[5] << 8) | data[4]; // Bytes 4 & 5 (ECG data description)
+
     _measureStage = _decodeMeasureStatus(measStatus);
     _leadOff = (info & 0x8000) != 0;
     final ampBits = (info >> 12) & 0x7;
     _ampMultiplier = _getAmpMultiplier(ampBits);
     final dataStruct = (info >> 8) & 0x07;
+
     if (dataStruct == 1 && data.length >= 56) {
       // 25 samples (structure-1)
+      // 6-byte header + 50-byte payload = 56 bytes
       final ecgBytes = data.sublist(6);
       for (int i = 0; i + 1 < ecgBytes.length && i < 50; i += 2) {
         int val = (ecgBytes[i + 1] << 8) | ecgBytes[i];
-        val &= 0x0FFF;
+        val &= 0x0FFF; // 12-bit ADC
         final mv = val * _adcToMv * _ampMultiplier;
         _pushSample(mv);
       }
       _log('📊 Tracking seg:$segNo stage:$_measureStage samples:25');
     } else if (dataStruct == 2 && data.length >= 15) {
       // Analysis result (structure-2)
-      final hr = data[13];
-      final resultCode = data[14];
+      // 6-byte header + 9-byte payload = 15 bytes
+      // Payload: Year(2), Month(1), Day(1), Hour(1), Min(1), Sec(1), HR(1), Result(1)
+      final hr = data[13]; // data[6+7]
+      final resultCode = data[14]; // data[6+8]
       _heartRate = hr;
       final analysisText = _getAnalysisText(resultCode);
       _log('📈 Analysis: HR=$hr, result=$resultCode ($analysisText)');
@@ -627,6 +640,7 @@ class _EcgHomePageState extends State<EcgHomePage> {
     final seq = data[0];
     final payload = data.sublist(1);
     // Real-time data (structure per protocol 4.2.2)
+    // 1-byte seq + 53-byte payload = 54 bytes total
     if (payload.length >= 53) {
       // 25 samples (50 bytes) + HR (1) + leadBattery (2)
       final hr = payload[50];
@@ -634,21 +648,21 @@ class _EcgHomePageState extends State<EcgHomePage> {
       final leadBatHi = payload[52];
       final info = (leadBatHi << 8) | leadBatLo;
       _leadOff = (info & 0x8000) != 0;
-      final ampBits = (info >> 12) & 0x7;
+      final ampBits = (info >> 12) & 0x7; // Using reserved bits, matches 0xDD
       _ampMultiplier = _getAmpMultiplier(ampBits);
-      _batteryMv = (info & 0x0FFF).toDouble();
+      _batteryMv = (info & 0x0FFF).toDouble(); // 12 bits for battery
       // Process samples with multiplier
       for (int i = 0; i < 25; i++) {
         final lo = payload[i * 2];
         final hi = payload[i * 2 + 1];
         int val = (hi << 8) | lo;
-        val &= 0x0FFF;
+        val &= 0x0FFF; // 12-bit ADC
         final mv = val * _adcToMv * _ampMultiplier;
         _pushSample(mv);
       }
       _heartRate = hr;
       // Send ACK
-      _write(buildPacket(0xAA, [seq, 0x00]));
+      _write(buildPacket(0xAA, [seq, 0x00])); // ACK with sequence number
       if (_lastSeqNo != seq) {
         _log('📡 Real-time seq:$seq HR:$hr battery:${_batteryMv.toInt()}mV');
         _lastSeqNo = seq;
@@ -675,7 +689,7 @@ class _EcgHomePageState extends State<EcgHomePage> {
   // ----- Sample Management -----
   void _pushSample(double mv) {
     if (mv.isNaN || mv.isInfinite) return;
-    if (mv.abs() < 0.02) return; // basic noise filter
+    // if (mv.abs() < 0.02) return; // basic noise filter - commented out
     // Add to collected buffer (full recording)
     _collectedSamples.add(mv);
     // Maintain live display buffer
@@ -686,9 +700,6 @@ class _EcgHomePageState extends State<EcgHomePage> {
   }
 
   // ----- Measurement Control -----
-  // NOTE: Removed user-triggered start measurement button.
-  // The device will drive measurement and send structure-2 result packets
-  // which will call _onMeasurementComplete(...).
   void _onMeasurementComplete(int? hr, int resultCode, String analysisText) {
     setState(() {
       _state = DeviceState.completed;
@@ -699,179 +710,21 @@ class _EcgHomePageState extends State<EcgHomePage> {
       context: context,
       barrierDismissible: true,
       builder: (context) {
-        final screenW = MediaQuery.of(context).size.width;
-        final dialogWidth = screenW;
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            final scrollController = ScrollController();
-            double sliderValue = 0.0;
-            final totalWidth = _calcScrollableWidth();
-            final visibleWidth =
-                screenW - 24.0; // Approx, accounting for padding
-            final maxSlider = (totalWidth - visibleWidth).clamp(
-              0.0,
-              double.infinity,
-            );
-
-            // Listener to sync slider with manual scroll
-            scrollController.addListener(() {
-              setDialogState(() {
-                sliderValue = scrollController.offset.clamp(0.0, maxSlider);
-              });
-            });
-
-            return Dialog(
-              insetPadding: EdgeInsets.zero,
-              backgroundColor: Colors.transparent,
-              child: Container(
-                width: dialogWidth,
-                margin: const EdgeInsets.symmetric(horizontal: 0, vertical: 40),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF0B0B10),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    // header
-                    Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 12,
-                      ),
-                      child: Row(
-                        children: [
-                          const Text(
-                            '📊 Measurement Complete',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          const Spacer(),
-                          IconButton(
-                            icon: const Icon(Icons.close),
-                            color: Colors.white70,
-                            onPressed: () {
-                              Navigator.of(context).pop();
-                              setState(() => _state = DeviceState.ready);
-                            },
-                          ),
-                        ],
-                      ),
-                    ),
-                    const Divider(height: 1, color: Colors.white12),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 12,
-                      ),
-                      child: Row(
-                        children: [
-                          Text(
-                            'Heart Rate: ${hr ?? '--'} bpm',
-                            style: const TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Text(
-                              'Result: ${_getAnalysisText(resultCode)}',
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          Text('Samples: ${_collectedSamples.length}'),
-                        ],
-                      ),
-                    ),
-                    const Divider(height: 1, color: Colors.white12),
-                    // Scrollable waveform area
-                    SizedBox(
-                      height: 220,
-                      child: Padding(
-                        padding: const EdgeInsets.all(12.0),
-                        child: ClipRRect(
-                          borderRadius: BorderRadius.circular(6),
-                          child: Container(
-                            color: Colors.black,
-                            child: SingleChildScrollView(
-                              controller: scrollController,
-                              scrollDirection: Axis.horizontal,
-                              child: CustomPaint(
-                                size: Size(totalWidth, 220),
-                                painter: ScrollableEcgPainter(
-                                  List<double>.from(_collectedSamples),
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                    // Slider for controlling the scroll
-                    if (maxSlider >
-                        0) // Only show if waveform is wider than visible area
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 16.0),
-                        child: Slider(
-                          value: sliderValue,
-                          min: 0.0,
-                          max: maxSlider,
-                          onChanged: (newValue) {
-                            setDialogState(() {
-                              sliderValue = newValue;
-                            });
-                            scrollController.jumpTo(newValue);
-                          },
-                        ),
-                      ),
-                    const SizedBox(height: 12),
-                    // actions
-                    Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 8,
-                      ),
-                      child: Row(
-                        children: [
-                          ElevatedButton(
-                            onPressed: () {
-                              Navigator.of(context).pop();
-                              setState(() => _state = DeviceState.ready);
-                            },
-                            child: const Text('OK'),
-                          ),
-                          const SizedBox(width: 8),
-                          ElevatedButton(
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Colors.green,
-                            ),
-                            onPressed: () {
-                              Navigator.of(context).pop();
-                              setState(() => _state = DeviceState.ready);
-                            },
-                            child: const Text('Done'),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            );
+        // ===== FIX =====
+        // Use a dedicated StatefulWidget for the dialog content
+        // to correctly manage the state of the slider and scrollbar.
+        return _EcgResultDialog(
+          collectedSamples: List<double>.from(_collectedSamples),
+          heartRate: hr,
+          resultCode: resultCode,
+          analysisText: analysisText,
+          onDone: () {
+            Navigator.of(context).pop();
+            setState(() => _state = DeviceState.ready);
           },
         );
       },
     );
-  }
-
-  double _calcScrollableWidth() {
-    // px per sample for horizontal scroll; adjust for density and readability
-    const pxPerSample = 2.0; // small value makes waveform wider; tune as needed
-    final w = (_collectedSamples.length * pxPerSample).clamp(300.0, 50000.0);
-    return w;
   }
 
   // ----- Helper Methods -----
@@ -1206,6 +1059,200 @@ class _EcgHomePageState extends State<EcgHomePage> {
   }
 }
 
+// ===== NEW STATEFUL WIDGET FOR DIALOG CONTENT =====
+// This widget fixes the slider bug by correctly managing its own state.
+class _EcgResultDialog extends StatefulWidget {
+  final List<double> collectedSamples;
+  final int? heartRate;
+  final int resultCode;
+  final String analysisText;
+  final VoidCallback onDone;
+
+  const _EcgResultDialog({
+    required this.collectedSamples,
+    this.heartRate,
+    required this.resultCode,
+    required this.analysisText,
+    required this.onDone,
+  });
+
+  @override
+  _EcgResultDialogState createState() => _EcgResultDialogState();
+}
+
+class _EcgResultDialogState extends State<_EcgResultDialog> {
+  late final ScrollController _scrollController;
+  double _sliderValue = 0.0;
+
+  late final double _pxPerSample;
+  late final double _totalWidth;
+  late double _maxSlider;
+  bool _listenerAdded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scrollController = ScrollController();
+
+    // FIX: Use a denser pxPerSample to reduce the "big space"
+    _pxPerSample = 0.5;
+    _totalWidth = (widget.collectedSamples.length * _pxPerSample).clamp(
+      300.0,
+      100000.0,
+    );
+    _maxSlider = 0.0; // Will be calculated in build()
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _addScrollListener() {
+    if (_listenerAdded) return;
+    _scrollController.addListener(() {
+      if (mounted) {
+        setState(() {
+          _sliderValue = _scrollController.offset.clamp(0.0, _maxSlider);
+        });
+      }
+    });
+    _listenerAdded = true;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final screenW = MediaQuery.of(context).size.width;
+    final visibleWidth = screenW - 24.0; // Approx, accounting for padding
+    _maxSlider = (_totalWidth - visibleWidth).clamp(0.0, double.infinity);
+
+    // Add listener here, now that we have _maxSlider and context
+    if (!_listenerAdded) {
+      _addScrollListener();
+    }
+
+    return Dialog(
+      insetPadding: EdgeInsets.zero,
+      backgroundColor: Colors.transparent,
+      child: Container(
+        width: screenW,
+        margin: const EdgeInsets.symmetric(horizontal: 0, vertical: 40),
+        decoration: BoxDecoration(
+          color: const Color(0xFF0B0B10),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // header
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              child: Row(
+                children: [
+                  const Text(
+                    '📊 Measurement Complete',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  const Spacer(),
+                  IconButton(
+                    icon: const Icon(Icons.close),
+                    color: Colors.white70,
+                    onPressed: widget.onDone,
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1, color: Colors.white12),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              child: Row(
+                children: [
+                  Text(
+                    'Heart Rate: ${widget.heartRate ?? '--'} bpm',
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(child: Text('Result: ${widget.analysisText}')),
+                  const SizedBox(width: 12),
+                  Text('Samples: ${widget.collectedSamples.length}'),
+                ],
+              ),
+            ),
+            const Divider(height: 1, color: Colors.white12),
+            // Scrollable waveform area
+            SizedBox(
+              height: 220,
+              child: Padding(
+                padding: const EdgeInsets.all(12.0),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: Container(
+                    color: Colors.black,
+                    child: SingleChildScrollView(
+                      controller: _scrollController,
+                      scrollDirection: Axis.horizontal,
+                      child: CustomPaint(
+                        size: Size(_totalWidth, 220),
+                        painter: ScrollableEcgPainter(
+                          widget.collectedSamples,
+                          pxPerSample: _pxPerSample, // Pass in the denser value
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            // Slider for controlling the scroll
+            if (_maxSlider >
+                0) // Only show if waveform is wider than visible area
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                child: Slider(
+                  value: _sliderValue,
+                  min: 0.0,
+                  max: _maxSlider,
+                  onChanged: (newValue) {
+                    setState(() {
+                      _sliderValue = newValue;
+                    });
+                    _scrollController.jumpTo(newValue);
+                  },
+                ),
+              ),
+            const SizedBox(height: 12),
+            // actions
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Row(
+                children: [
+                  ElevatedButton(
+                    onPressed: widget.onDone,
+                    child: const Text('OK'),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.green,
+                    ),
+                    onPressed: widget.onDone,
+                    child: const Text('Done'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+// ===== END NEW DIALOG WIDGET =====
+
 // ----- Live ECG Painter (used during measuring) -----
 // Smooth-ish visual for live rendering; limited horizontal width (fits widget)
 class LiveEcgPainter extends CustomPainter {
@@ -1236,7 +1283,7 @@ class LiveEcgPainter extends CustomPainter {
     double minMv = samples.reduce(math.min);
     double maxMv = samples.reduce(math.max);
     double range = (maxMv - minMv);
-    if (range < 0.5) {
+    if (range.abs() < 0.5) {
       minMv = -1.5;
       maxMv = 1.5;
       range = 3.0;
@@ -1273,59 +1320,6 @@ class LiveEcgPainter extends CustomPainter {
 
 // ----- Scrollable ECG Painter (simple polyline) -----
 // Used inside the result dialog for the full recording; scrollable horizontally.
-// class ScrollableEcgPainter extends CustomPainter {
-//   final List<double> samples;
-//   ScrollableEcgPainter(this.samples);
-//   @override
-//   void paint(Canvas canvas, Size size) {
-//     final bg = Paint()..color = Colors.black;
-//     canvas.drawRect(Offset.zero & size, bg);
-//     // baseline center
-//     final baselinePaint = Paint()..color = Colors.white12;
-//     canvas.drawLine(
-//       Offset(0, size.height / 2),
-//       Offset(size.width, size.height / 2),
-//       baselinePaint,
-//     );
-//     if (samples.isEmpty) return;
-//     double minMv = samples.reduce(math.min);
-//     double maxMv = samples.reduce(math.max);
-//     double range = (maxMv - minMv);
-//     if (range < 0.5) {
-//       minMv = -1.5;
-//       maxMv = 1.5;
-//       range = 3.0;
-//     } else {
-//       final margin = range * 0.2;
-//       minMv -= margin;
-//       maxMv += margin;
-//       range = maxMv - minMv;
-//     }
-//     // Use px-per-sample proportional to width
-//     final pxPerSample = size.width / (samples.length > 0 ? samples.length : 1);
-//     final path = Path();
-//     for (int i = 0; i < samples.length; i++) {
-//       final x = i * pxPerSample;
-//       final norm = (samples[i] - minMv) / range;
-//       final y = size.height - (norm * size.height);
-//       if (i == 0) {
-//         path.moveTo(x, y);
-//       } else {
-//         path.lineTo(x, y);
-//       }
-//     }
-//     final paint = Paint()
-//       ..style = PaintingStyle.stroke
-//       ..strokeWidth = 1.6
-//       ..color = Colors.greenAccent;
-//     canvas.drawPath(path, paint);
-//   }
-
-//   @override
-//   bool shouldRepaint(covariant ScrollableEcgPainter oldDelegate) =>
-//       !listEquals(oldDelegate.samples, samples);
-// }
-
 class ScrollableEcgPainter extends CustomPainter {
   final List<double> samples;
   final double pxPerSample;
@@ -1348,7 +1342,7 @@ class ScrollableEcgPainter extends CustomPainter {
     double minMv = samples.reduce(math.min);
     double maxMv = samples.reduce(math.max);
     double range = maxMv - minMv;
-    if (range < 0.5) {
+    if (range.abs() < 0.5) {
       minMv = -1.5;
       maxMv = 1.5;
       range = 3.0;
@@ -1357,6 +1351,9 @@ class ScrollableEcgPainter extends CustomPainter {
     final path = Path();
     for (int i = 0; i < samples.length; i++) {
       final x = i * pxPerSample;
+      // Handle potential bad data
+      if (samples[i].isNaN || samples[i].isInfinite) continue;
+
       final norm = (samples[i] - minMv) / range;
       final y = size.height - (norm * size.height);
       if (i == 0) {
@@ -1376,10 +1373,12 @@ class ScrollableEcgPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant ScrollableEcgPainter oldDelegate) =>
-      oldDelegate.samples != samples;
+      !listEquals(oldDelegate.samples, samples) ||
+      oldDelegate.pxPerSample != pxPerSample;
 }
 
 // Helper: deep listEquals (for shouldRepaint)
+// MOVED to top level
 bool listEquals(List<double>? a, List<double>? b) {
   if (a == null || b == null) return a == b;
   if (a.length != b.length) return false;
