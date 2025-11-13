@@ -1044,7 +1044,7 @@ class _EcgHomePageState extends State<EcgHomePage> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.2),
+        color: color.withValues(alpha: 0.2),
         border: Border.all(color: color),
         borderRadius: BorderRadius.circular(16),
       ),
@@ -1216,7 +1216,7 @@ class LiveEcgPainter extends CustomPainter {
     final bg = Paint()..color = const Color(0xFF050507);
     canvas.drawRect(Offset.zero & size, bg);
     final gridPaint = Paint()
-      ..color = Colors.grey.withOpacity(0.12)
+      ..color = Colors.grey.withValues(alpha: 0.12)
       ..strokeWidth = 0.5;
     const double mmPerCell = 10;
     for (double x = 0; x <= size.width; x += mmPerCell) {
@@ -1273,36 +1273,87 @@ class LiveEcgPainter extends CustomPainter {
 
 // ----- Scrollable ECG Painter (simple polyline) -----
 // Used inside the result dialog for the full recording; scrollable horizontally.
+// class ScrollableEcgPainter extends CustomPainter {
+//   final List<double> samples;
+//   ScrollableEcgPainter(this.samples);
+//   @override
+//   void paint(Canvas canvas, Size size) {
+//     final bg = Paint()..color = Colors.black;
+//     canvas.drawRect(Offset.zero & size, bg);
+//     // baseline center
+//     final baselinePaint = Paint()..color = Colors.white12;
+//     canvas.drawLine(
+//       Offset(0, size.height / 2),
+//       Offset(size.width, size.height / 2),
+//       baselinePaint,
+//     );
+//     if (samples.isEmpty) return;
+//     double minMv = samples.reduce(math.min);
+//     double maxMv = samples.reduce(math.max);
+//     double range = (maxMv - minMv);
+//     if (range < 0.5) {
+//       minMv = -1.5;
+//       maxMv = 1.5;
+//       range = 3.0;
+//     } else {
+//       final margin = range * 0.2;
+//       minMv -= margin;
+//       maxMv += margin;
+//       range = maxMv - minMv;
+//     }
+//     // Use px-per-sample proportional to width
+//     final pxPerSample = size.width / (samples.length > 0 ? samples.length : 1);
+//     final path = Path();
+//     for (int i = 0; i < samples.length; i++) {
+//       final x = i * pxPerSample;
+//       final norm = (samples[i] - minMv) / range;
+//       final y = size.height - (norm * size.height);
+//       if (i == 0) {
+//         path.moveTo(x, y);
+//       } else {
+//         path.lineTo(x, y);
+//       }
+//     }
+//     final paint = Paint()
+//       ..style = PaintingStyle.stroke
+//       ..strokeWidth = 1.6
+//       ..color = Colors.greenAccent;
+//     canvas.drawPath(path, paint);
+//   }
+
+//   @override
+//   bool shouldRepaint(covariant ScrollableEcgPainter oldDelegate) =>
+//       !listEquals(oldDelegate.samples, samples);
+// }
+
 class ScrollableEcgPainter extends CustomPainter {
   final List<double> samples;
-  ScrollableEcgPainter(this.samples);
+  final double pxPerSample;
+  ScrollableEcgPainter(this.samples, {this.pxPerSample = 2.0});
+
   @override
   void paint(Canvas canvas, Size size) {
     final bg = Paint()..color = Colors.black;
     canvas.drawRect(Offset.zero & size, bg);
-    // baseline center
+
     final baselinePaint = Paint()..color = Colors.white12;
     canvas.drawLine(
       Offset(0, size.height / 2),
       Offset(size.width, size.height / 2),
       baselinePaint,
     );
+
     if (samples.isEmpty) return;
+
     double minMv = samples.reduce(math.min);
     double maxMv = samples.reduce(math.max);
-    double range = (maxMv - minMv);
+    double range = maxMv - minMv;
     if (range < 0.5) {
       minMv = -1.5;
       maxMv = 1.5;
       range = 3.0;
-    } else {
-      final margin = range * 0.2;
-      minMv -= margin;
-      maxMv += margin;
-      range = maxMv - minMv;
     }
-    // Use px-per-sample proportional to width
-    final pxPerSample = size.width / (samples.length > 0 ? samples.length : 1);
+
     final path = Path();
     for (int i = 0; i < samples.length; i++) {
       final x = i * pxPerSample;
@@ -1314,16 +1365,18 @@ class ScrollableEcgPainter extends CustomPainter {
         path.lineTo(x, y);
       }
     }
+
     final paint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.6
       ..color = Colors.greenAccent;
+
     canvas.drawPath(path, paint);
   }
 
   @override
   bool shouldRepaint(covariant ScrollableEcgPainter oldDelegate) =>
-      !listEquals(oldDelegate.samples, samples);
+      oldDelegate.samples != samples;
 }
 
 // Helper: deep listEquals (for shouldRepaint)
